@@ -1,4 +1,4 @@
-# external_client.py (v5.5 - 超时停止版)
+# external_client.py (v5.7 - 现代化UI版)
 
 import os
 import sys
@@ -12,14 +12,16 @@ import threading
 import queue
 import keyring
 from datetime import datetime
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import messagebox
 import tkinter as tk
 
 try:
-    from ttkthemes import ThemedTk
-    THEMED_TK_AVAILABLE = True
+    import customtkinter as ctk
+    from tkinter import ttk, scrolledtext
+    CTK_AVAILABLE = True
 except ImportError:
-    THEMED_TK_AVAILABLE = False
+    from tkinter import ttk, scrolledtext
+    CTK_AVAILABLE = False
 
 import urllib.parse
 
@@ -59,12 +61,30 @@ class SplashScreen:
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("安全云剪切板 (下载端) v5.5 - 超时停止版")
+        self.root.title("安全云剪切板 (下载端) v5.8 - LocalSend风格")
         self.password = None
         self.config_manager = ConfigManager()
         self.download_dir = "./downloads/"
         self.temp_chunk_dir = os.path.join(self.download_dir, "temp_chunks")
-        self.poll_interval = 10
+        
+        # 智能轮询配置
+        self.base_poll_interval = 5  # 基础间隔5秒
+        self.current_poll_interval = 5  # 当前动态间隔
+        self.max_poll_interval = 60  # 最大间隔60秒
+        self.poll_increase_factor = 1.5  # 间隔递增因子
+        self.consecutive_empty_polls = 0  # 连续空轮询计数
+        self.auto_stop_minutes = 10  # 10分钟无文件自动停止
+        
+        # 初始化设计系统颜色（默认值，会在setup_styles中更新）
+        self.colors = {
+            'primary': '#3b82f6',
+            'success': '#10b981', 
+            'danger': '#ef4444',
+            'warning': '#f59e0b',
+            'text': '#0f172a',
+            'text_secondary': '#64748b'
+        }
+        
         self.is_monitoring = threading.Event()
         self.monitor_thread = None
         self.status_queue = queue.Queue()
@@ -72,8 +92,14 @@ class DownloaderApp:
         self.merge_locks = {}
         self.locks_lock = threading.Lock()
         self.last_file_found_time = None
-        self.root.geometry("800x600")
-        self.root.minsize(700, 500)
+        self.root.geometry("1000x800")
+        self.root.minsize(900, 700)
+        
+        # 设置CustomTkinter主题
+        if CTK_AVAILABLE:
+            ctk.set_appearance_mode("light")  # 默认浅色主题
+            ctk.set_default_color_theme("blue")  # 蓝色主题
+        
         self.setup_styles()
         self.process_queue()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -90,7 +116,17 @@ class DownloaderApp:
             config = self.config_manager.load_config()
             self.download_dir = config['DEFAULT']['DOWNLOAD_DIR']
             self.temp_chunk_dir = os.path.join(self.download_dir, "temp_chunks")
-            self.poll_interval = int(config['DEFAULT'].get('POLL_INTERVAL_SECONDS', 10))
+            
+            # 加载智能轮询配置
+            self.base_poll_interval = int(config['DEFAULT'].get('BASE_POLL_INTERVAL', 5))
+            self.current_poll_interval = self.base_poll_interval
+            self.max_poll_interval = int(config['DEFAULT'].get('MAX_POLL_INTERVAL', 60))
+            self.poll_increase_factor = float(config['DEFAULT'].get('POLL_INCREASE_FACTOR', 1.5))
+            self.auto_stop_minutes = int(config['DEFAULT'].get('AUTO_STOP_MINUTES', 10))
+            
+            # 记录智能轮询配置
+            self.status_queue.put(('log', (f'智能轮询配置加载: 基础间隔={self.base_poll_interval}s, 最大间隔={self.max_poll_interval}s, 递增因子={self.poll_increase_factor}, 自动停止={self.auto_stop_minutes}分钟', 'info')))
+            
             if not os.path.exists(self.download_dir): os.makedirs(self.download_dir)
             if not os.path.exists(self.temp_chunk_dir): os.makedirs(self.temp_chunk_dir)
 
@@ -114,20 +150,32 @@ class DownloaderApp:
                 if msg_type == 'init_success':
                     self.create_widgets()
                     self.log_message(message, 'success')
-                    self.start_button.config(state='normal')
-                    self.status_label.config(text="状态: 已就绪")
+                    if CTK_AVAILABLE:
+                        self.start_button.configure(state='normal')
+                        self.status_label.configure(text="状态: 已就绪", text_color=self.colors['success'])
+                        self.header_status.configure(text="已就绪", fg_color=self.colors['success'])
+                    else:
+                        self.start_button.config(state='normal')
+                        self.status_label.config(text="状态: 已就绪")
                 elif msg_type == 'init_fail':
                     self.create_widgets()
                     self.log_message(message, 'error')
                     messagebox.showerror("启动错误", message)
-                    self.status_label.config(text="状态: 启动失败")
+                    if CTK_AVAILABLE:
+                        self.status_label.configure(text="状态: 启动失败", text_color=self.colors['danger'])
+                        self.header_status.configure(text="启动失败", fg_color=self.colors['danger'])
+                    else:
+                        self.status_label.config(text="状态: 启动失败")
                 elif msg_type == 'log':
                     if hasattr(self, 'log_area'):
                         log_message, log_type = message
                         self.log_message(log_message, log_type)
                 elif msg_type == 'update_count':
                     if hasattr(self, 'count_label'):
-                        self.count_label.config(text=f"已下载: {self.download_count}")
+                        if CTK_AVAILABLE:
+                            self.count_label.configure(text=f"已下载: {self.download_count}")
+                        else:
+                            self.count_label.config(text=f"已下载: {self.download_count}")
         except queue.Empty:
             pass
         self.root.after(100, self.process_queue)
@@ -138,20 +186,257 @@ class DownloaderApp:
             self.root.destroy()
 
     def setup_styles(self):
-        style = ttk.Style(self.root)
-        style.configure("TFrame", background="#f0f0f0")
-        style.configure("TLabel", background="#f0f0f0", font=('Segoe UI', 10))
-        style.configure("TButton", font=('Segoe UI', 10))
-        style.configure("Accent.TButton", font=('Segoe UI', 10, 'bold'))
-        style.map('Accent.TButton', background=[('active', '#2E7D32'), ('!disabled', '#9E9E9E')],
-                  foreground=[('!disabled', 'white')])
-        style.configure("Stop.TButton", font=('Segoe UI', 10, 'bold'))
-        style.map('Stop.TButton', background=[('active', '#c62828'), ('!disabled', '#F44336')],
-                  foreground=[('!disabled', 'white')])
-        style.configure("TLabelframe", background="#f0f0f0", borderwidth=1, relief="groove")
-        style.configure("TLabelframe.Label", background="#f0f0f0", font=('Segoe UI', 11, 'bold'))
+        if CTK_AVAILABLE:
+            # LocalSend风格：清新简约色彩方案
+            ctk.set_appearance_mode("light")  # 浅色主题
+            self.root.configure(fg_color="#f8fafc")  # 浅灰蓝背景
+            
+            # 定义设计系统颜色
+            self.colors = {
+                'primary': '#3b82f6',      # 蓝色主色调
+                'primary_hover': '#2563eb', # 深蓝悬停
+                'success': '#10b981',       # 绿色成功
+                'success_hover': '#059669', # 深绿悬停
+                'danger': '#ef4444',        # 红色危险
+                'danger_hover': '#dc2626',  # 深红悬停
+                'warning': '#f59e0b',       # 橙色警告
+                'background': '#f8fafc',    # 背景色
+                'card': '#ffffff',          # 卡片背景
+                'card_hover': '#f1f5f9',    # 卡片悬停
+                'text': '#0f172a',          # 主文本
+                'text_secondary': '#64748b', # 次要文本
+                'border': '#e2e8f0',        # 边框色
+                'shadow': '#00000010'       # 阴影色
+            }
+        else:
+            # 传统Tkinter样式配置（保持向后兼容）
+            style = ttk.Style(self.root)
+            style.configure("TFrame", background="#f8fafc")
+            style.configure("TLabel", background="#f8fafc", font=('SF Pro Display', 11))
+            style.configure("TButton", font=('SF Pro Display', 11))
+            style.configure("Accent.TButton", font=('SF Pro Display', 11, 'bold'))
+            style.map('Accent.TButton', background=[('active', '#2563eb'), ('!disabled', '#3b82f6')],
+                      foreground=[('!disabled', 'white')])
+            style.configure("Stop.TButton", font=('SF Pro Display', 11, 'bold'))
+            style.map('Stop.TButton', background=[('active', '#dc2626'), ('!disabled', '#ef4444')],
+                      foreground=[('!disabled', 'white')])
+            style.configure("TLabelframe", background="#f8fafc", borderwidth=0, relief="flat")
+            style.configure("TLabelframe.Label", background="#f8fafc", font=('SF Pro Display', 12, 'bold'))
 
     def create_widgets(self):
+        if CTK_AVAILABLE:
+            self.create_modern_widgets()
+        else:
+            self.create_classic_widgets()
+    
+    def create_modern_widgets(self):
+        # LocalSend风格的现代化界面
+        # 主容器 - 无边框，纯净背景
+        main_container = ctk.CTkFrame(self.root, 
+                                     corner_radius=0, 
+                                     fg_color=self.colors['background'],
+                                     border_width=0)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=24, pady=24)
+        
+        # 顶部标题卡片 - 渐变效果
+        header_card = ctk.CTkFrame(main_container, 
+                                  corner_radius=20, 
+                                  fg_color=self.colors['card'],
+                                  border_width=1,
+                                  border_color=self.colors['border'],
+                                  height=100)
+        header_card.pack(fill=tk.X, pady=(0, 20))
+        header_card.pack_propagate(False)
+        
+        # 标题内容
+        header_content = ctk.CTkFrame(header_card, fg_color="transparent")
+        header_content.pack(fill=tk.BOTH, expand=True, padx=32, pady=20)
+        
+        # 图标和标题
+        title_frame = ctk.CTkFrame(header_content, fg_color="transparent")
+        title_frame.pack(side=tk.LEFT, fill=tk.Y)
+        
+        # 主标题
+        title_label = ctk.CTkLabel(title_frame, 
+                                  text="🛡️ 安全云剪切板", 
+                                  font=ctk.CTkFont(family="SF Pro Display", size=28, weight="bold"),
+                                  text_color=self.colors['text'])
+        title_label.pack(anchor="w")
+        
+        # 副标题
+        subtitle_label = ctk.CTkLabel(title_frame, 
+                                     text="文件下载与同步工具 • 智能轮询 • 现代界面", 
+                                     font=ctk.CTkFont(family="SF Pro Display", size=14),
+                                     text_color=self.colors['text_secondary'])
+        subtitle_label.pack(anchor="w", pady=(4, 0))
+        
+        # 右侧状态指示器
+        status_indicator = ctk.CTkFrame(header_content, 
+                                       corner_radius=12, 
+                                       fg_color=self.colors['warning'],
+                                       width=120, height=40)
+        status_indicator.pack(side=tk.RIGHT, fill=tk.Y)
+        status_indicator.pack_propagate(False)
+        
+        self.header_status = ctk.CTkLabel(status_indicator, 
+                                         text="初始化中", 
+                                         font=ctk.CTkFont(family="SF Pro Display", size=12, weight="bold"),
+                                         text_color="white")
+        self.header_status.pack(expand=True)
+        
+        # 控制面板卡片
+        control_card = ctk.CTkFrame(main_container, 
+                                   corner_radius=20, 
+                                   fg_color=self.colors['card'],
+                                   border_width=1,
+                                   border_color=self.colors['border'])
+        control_card.pack(fill=tk.X, pady=(0, 20))
+        
+        # 控制面板标题
+        control_header = ctk.CTkFrame(control_card, fg_color="transparent", height=60)
+        control_header.pack(fill=tk.X, padx=32, pady=(24, 0))
+        control_header.pack_propagate(False)
+        
+        control_title = ctk.CTkLabel(control_header, 
+                                    text="📋 操作控制", 
+                                    font=ctk.CTkFont(family="SF Pro Display", size=18, weight="bold"),
+                                    text_color=self.colors['text'])
+        control_title.pack(side=tk.LEFT, pady=12)
+        
+        # 按钮容器
+        button_container = ctk.CTkFrame(control_card, fg_color="transparent")
+        button_container.pack(fill=tk.X, padx=32, pady=(0, 24))
+        
+        # 主要操作按钮
+        self.start_button = ctk.CTkButton(button_container, 
+                                         text="▶️  开始监控", 
+                                         command=self.start_monitoring,
+                                         height=52, width=160,
+                                         font=ctk.CTkFont(family="SF Pro Display", size=15, weight="bold"),
+                                         corner_radius=16,
+                                         fg_color=self.colors['primary'],
+                                         hover_color=self.colors['primary_hover'],
+                                         state='disabled')
+        self.start_button.pack(side=tk.LEFT, padx=(0, 16))
+        
+        self.stop_button = ctk.CTkButton(button_container, 
+                                        text="⏸️  停止监控", 
+                                        command=self.stop_monitoring,
+                                        height=52, width=160,
+                                        font=ctk.CTkFont(family="SF Pro Display", size=15, weight="bold"),
+                                        corner_radius=16,
+                                        fg_color=self.colors['danger'],
+                                        hover_color=self.colors['danger_hover'],
+                                        state='disabled')
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 16))
+        
+        # 辅助操作按钮
+        self.open_folder_button = ctk.CTkButton(button_container, 
+                                               text="📁  打开文件夹", 
+                                               command=self.open_download_folder,
+                                               height=52, width=160,
+                                               font=ctk.CTkFont(family="SF Pro Display", size=15),
+                                               corner_radius=16,
+                                               fg_color="transparent",
+                                               border_width=2,
+                                               border_color=self.colors['border'],
+                                               text_color=self.colors['text'],
+                                               hover_color=self.colors['card_hover'])
+        self.open_folder_button.pack(side=tk.RIGHT)
+        
+        # 状态信息卡片
+        status_card = ctk.CTkFrame(main_container, 
+                                  corner_radius=20, 
+                                  fg_color=self.colors['card'],
+                                  border_width=1,
+                                  border_color=self.colors['border'])
+        status_card.pack(fill=tk.X, pady=(0, 20))
+        
+        # 状态卡片内容
+        status_content = ctk.CTkFrame(status_card, fg_color="transparent")
+        status_content.pack(fill=tk.X, padx=32, pady=24)
+        
+        # 状态标题
+        status_title = ctk.CTkLabel(status_content, 
+                                   text="📊 运行状态", 
+                                   font=ctk.CTkFont(family="SF Pro Display", size=18, weight="bold"),
+                                   text_color=self.colors['text'])
+        status_title.pack(anchor="w", pady=(0, 16))
+        
+        # 状态指标网格
+        metrics_grid = ctk.CTkFrame(status_content, fg_color="transparent")
+        metrics_grid.pack(fill=tk.X)
+        
+        # 左侧状态
+        left_metrics = ctk.CTkFrame(metrics_grid, fg_color="transparent")
+        left_metrics.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        self.status_label = ctk.CTkLabel(left_metrics, 
+                                        text="状态: 初始化中...", 
+                                        font=ctk.CTkFont(family="SF Pro Display", size=16, weight="bold"),
+                                        text_color=self.colors['warning'])
+        self.status_label.pack(anchor="w")
+        
+        # 右侧计数器
+        right_metrics = ctk.CTkFrame(metrics_grid, fg_color="transparent")
+        right_metrics.pack(side=tk.RIGHT)
+        
+        self.count_label = ctk.CTkLabel(right_metrics, 
+                                       text="已下载: 0", 
+                                       font=ctk.CTkFont(family="SF Pro Display", size=16),
+                                       text_color=self.colors['text_secondary'])
+        self.count_label.pack(anchor="e")
+        
+        # 日志卡片
+        log_card = ctk.CTkFrame(main_container, 
+                               corner_radius=20, 
+                               fg_color=self.colors['card'],
+                               border_width=1,
+                               border_color=self.colors['border'])
+        log_card.pack(fill=tk.BOTH, expand=True)
+        
+        # 日志头部
+        log_header = ctk.CTkFrame(log_card, fg_color="transparent", height=60)
+        log_header.pack(fill=tk.X, padx=32, pady=(24, 0))
+        log_header.pack_propagate(False)
+        
+        log_title = ctk.CTkLabel(log_header, 
+                                text="📝 活动日志", 
+                                font=ctk.CTkFont(family="SF Pro Display", size=18, weight="bold"),
+                                text_color=self.colors['text'])
+        log_title.pack(side=tk.LEFT, pady=12)
+        
+        clear_button = ctk.CTkButton(log_header, 
+                                    text="🗑️ 清空", 
+                                    command=self.clear_log,
+                                    width=80, height=32,
+                                    font=ctk.CTkFont(family="SF Pro Display", size=12),
+                                    corner_radius=10,
+                                    fg_color="transparent",
+                                    border_width=1,
+                                    border_color=self.colors['border'],
+                                    text_color=self.colors['text_secondary'],
+                                    hover_color=self.colors['card_hover'])
+        clear_button.pack(side=tk.RIGHT, pady=12)
+        
+        # 日志内容区域
+        log_content = ctk.CTkFrame(log_card, 
+                                  corner_radius=16, 
+                                  fg_color="#f8fafc",
+                                  border_width=1,
+                                  border_color=self.colors['border'])
+        log_content.pack(fill=tk.BOTH, expand=True, padx=32, pady=(0, 24))
+        
+        self.log_area = ctk.CTkTextbox(log_content, 
+                                      font=ctk.CTkFont(family="JetBrains Mono", size=11),
+                                      corner_radius=12,
+                                      fg_color="#ffffff",
+                                      border_width=0,
+                                      state='disabled')
+        self.log_area.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        
+    def create_classic_widgets(self):
+        # 经典界面（向后兼容）
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         control_frame = ttk.LabelFrame(main_frame, text="控制面板", padding="10")
@@ -176,30 +461,87 @@ class DownloaderApp:
 
     def log_message(self, message, msg_type='info'):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        icons = {'info': "ℹ️", 'success': "✅", 'error': "❌", 'warning': "⚠️"}
-        self.log_area.config(state='normal')
-        self.log_area.insert(tk.END, f"[{timestamp}] {icons.get(msg_type, 'ℹ️')} {message}\n")
-        self.log_area.config(state='disabled')
-        self.log_area.see(tk.END)
+        # LocalSend风格的日志图标
+        icons = {
+            'info': "💬", 
+            'success': "✅", 
+            'error': "❌", 
+            'warning': "⚠️",
+            'upload': "🚀",
+            'download': "📥",
+            'network': "🌐"
+        }
+        
+        # 根据消息类型选择颜色
+        colors = {
+            'info': '#64748b',
+            'success': '#10b981', 
+            'error': '#ef4444',
+            'warning': '#f59e0b',
+            'upload': '#3b82f6',
+            'download': '#8b5cf6',
+            'network': '#06b6d4'
+        }
+        
+        if CTK_AVAILABLE and hasattr(self.log_area, 'configure'):
+            # CustomTkinter TextBox
+            self.log_area.configure(state='normal')
+            
+            # 添加带颜色的日志条目
+            log_line = f"[{timestamp}] {icons.get(msg_type, '💬')} {message}\n"
+            self.log_area.insert(tk.END, log_line)
+            
+            self.log_area.configure(state='disabled')
+            self.log_area.see(tk.END)
+        else:
+            # 经典ScrolledText
+            self.log_area.config(state='normal')
+            self.log_area.insert(tk.END, f"[{timestamp}] {icons.get(msg_type, '💬')} {message}\n")
+            self.log_area.config(state='disabled')
+            self.log_area.see(tk.END)
 
     def start_monitoring(self):
         if not self.is_monitoring.is_set():
-            self.is_monitoring.set()
+            # 重置轮询状态
+            self.current_poll_interval = self.base_poll_interval
+            self.consecutive_empty_polls = 0
             self.last_file_found_time = time.time()
-            self.start_button.config(state='disabled')
-            self.stop_button.config(state='normal')
-            self.status_label.config(text="状态: 监控中...")
+            
+            self.is_monitoring.set()
+            
+            # 更新按钮状态和样式
+            if CTK_AVAILABLE:
+                self.start_button.configure(state='disabled')
+                self.stop_button.configure(state='normal')
+                self.status_label.configure(text="状态: 智能监控中...", text_color=self.colors['primary'])
+                self.header_status.configure(text="监控中", fg_color=self.colors['primary'])
+            else:
+                self.start_button.config(state='disabled')
+                self.stop_button.config(state='normal')
+                self.status_label.config(text="状态: 智能监控中...")
+            
             self.monitor_thread = threading.Thread(target=self.monitor_files_worker, daemon=True)
             self.monitor_thread.start()
-            self.status_queue.put(('log', ("监控已启动", 'success')))
+            self.status_queue.put(('log', (f"智能监控已启动，初始间隔: {self.base_poll_interval}s", 'success')))
 
     def stop_monitoring(self):
         if self.is_monitoring.is_set():
             self.is_monitoring.clear()
-            self.start_button.config(state='normal')
-            self.stop_button.config(state='disabled')
-            self.status_label.config(text="状态: 已停止")
-            self.status_queue.put(('log', ("监控已停止，等待当前轮询结束...", 'warning')))
+            
+            # 更新按钮状态和样式
+            if CTK_AVAILABLE:
+                self.start_button.configure(state='normal')
+                self.stop_button.configure(state='disabled')
+                self.status_label.configure(text="状态: 已停止", text_color=self.colors['warning'])
+                self.header_status.configure(text="已停止", fg_color=self.colors['warning'])
+            else:
+                self.start_button.config(state='normal')
+                self.stop_button.config(state='disabled')
+                self.status_label.config(text="状态: 已停止")
+            
+            # 显示智能轮询统计信息
+            stats_msg = f"监控已停止，等待当前轮询结束... [统计: 连续空轮询{self.consecutive_empty_polls}次, 当前间隔{self.current_poll_interval:.1f}s]"
+            self.status_queue.put(('log', (stats_msg, 'warning')))
 
     def open_download_folder(self):
         try:
@@ -208,22 +550,66 @@ class DownloaderApp:
             messagebox.showerror("错误", f"无法打开文件夹: {e}")
 
     def clear_log(self):
-        self.log_area.config(state='normal')
-        self.log_area.delete('1.0', tk.END)
-        self.log_area.config(state='disabled')
+        if CTK_AVAILABLE and hasattr(self.log_area, 'configure'):
+            # CustomTkinter TextBox
+            self.log_area.configure(state='normal')
+            self.log_area.delete('1.0', tk.END)
+            self.log_area.configure(state='disabled')
+        else:
+            # 经典ScrolledText
+            self.log_area.config(state='normal')
+            self.log_area.delete('1.0', tk.END)
+            self.log_area.config(state='disabled')
 
     def monitor_files_worker(self):
-        AUTO_STOP_SECONDS = 300
+        """智能轮询工作线程 - 动态间隔，自适应停止"""
+        auto_stop_seconds = self.auto_stop_minutes * 60
+        
+        self.status_queue.put(('log', (f"智能轮询已启动，基础间隔: {self.base_poll_interval}s，最大间隔: {self.max_poll_interval}s", 'info')))
+        
         while self.is_monitoring.is_set():
-            self.process_files()
-            if self.is_monitoring.is_set():
-                if self.last_file_found_time and (time.time() - self.last_file_found_time > AUTO_STOP_SECONDS):
-                    self.status_queue.put(('log', (f"超过 {AUTO_STOP_SECONDS // 60} 分钟未发现新文件，自动停止监控。", 'warning')))
-                    self.stop_monitoring()
-            self.is_monitoring.wait(self.poll_interval)
-        self.status_queue.put(('log', ("监控线程已安全退出。", 'info')))
+            # 执行文件检查
+            files_found = self.process_files()
+            
+            if not self.is_monitoring.is_set():
+                break
+                
+            # 根据检查结果调整轮询间隔
+            if files_found:
+                # 发现文件，重置为基础间隔
+                self.consecutive_empty_polls = 0
+                self.current_poll_interval = self.base_poll_interval
+                self.last_file_found_time = time.time()
+                self.status_queue.put(('log', (f"发现文件，轮询间隔重置为 {self.current_poll_interval}s", 'success')))
+            else:
+                # 未发现文件，增加轮询间隔
+                self.consecutive_empty_polls += 1
+                
+                # 每3次空轮询增加一次间隔
+                if self.consecutive_empty_polls % 3 == 0:
+                    old_interval = self.current_poll_interval
+                    self.current_poll_interval = min(
+                        self.current_poll_interval * self.poll_increase_factor,
+                        self.max_poll_interval
+                    )
+                    if old_interval != self.current_poll_interval:
+                        self.status_queue.put(('log', (f"连续 {self.consecutive_empty_polls} 次空轮询，间隔调整为 {self.current_poll_interval:.1f}s", 'info')))
+            
+            # 检查自动停止条件
+            if self.last_file_found_time and (time.time() - self.last_file_found_time > auto_stop_seconds):
+                self.status_queue.put(('log', (f"超过 {self.auto_stop_minutes} 分钟未发现新文件，自动停止监控", 'warning')))
+                self.stop_monitoring()
+                break
+            
+            # 等待下次轮询（可中断）
+            wait_start = time.time()
+            while self.is_monitoring.is_set() and (time.time() - wait_start < self.current_poll_interval):
+                time.sleep(0.1)  # 短暂睡眠，每100ms检查一次停止信号
+        
+        self.status_queue.put(('log', ("智能轮询线程已安全退出", 'info')))
 
     def process_files(self):
+        """处理文件检查，返回是否找到文件"""
         config = self.config_manager.get_config()
         headers = {'Cookie': config['DEFAULT']['COOKIE'], 'User-Agent': 'Mozilla/5.0'}
         try:
@@ -231,18 +617,27 @@ class DownloaderApp:
             response.raise_for_status()
             data = response.json()
             items = data.get("items", [])
+            
             if not data.get("success") or not items:
-                return
-            self.last_file_found_time = time.time()
+                return False  # 未找到文件
+            
+            # 处理找到的文件
+            files_processed = 0
             for item in items:
                 if not self.is_monitoring.is_set():
                     break
                 if item['name'].startswith("chunk_"):
                     self.handle_chunk(item, config, headers)
+                    files_processed += 1
                 elif item['name'].startswith("clipboard_payload_"):
                     self.handle_single_file(item, config, headers)
+                    files_processed += 1
+            
+            return files_processed > 0  # 返回是否处理了文件
+            
         except Exception as e:
             self.status_queue.put(('log', (f"轮询时发生错误: {e}", 'error')))
+            return False  # 错误时返回未找到文件
 
     def handle_single_file(self, item, config, headers):
         try:
@@ -334,8 +729,10 @@ def main():
         if not os.path.exists('config.ini'):
             messagebox.showerror("错误", "未找到 config.ini 文件！\n请先运行 config_setup.py 进行配置。")
             return
-        if THEMED_TK_AVAILABLE:
-            root = ThemedTk(theme="plastik")
+        
+        # 初始化主窗口
+        if CTK_AVAILABLE:
+            root = ctk.CTk()
         else:
             root = tk.Tk()
         root.withdraw()
