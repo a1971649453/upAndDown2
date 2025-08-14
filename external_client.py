@@ -1,4 +1,4 @@
-# external_client.py (v5.7 - 现代化UI版)
+# external_client.py (v5.9 - 性能优化版)
 
 import os
 import sys
@@ -11,9 +11,12 @@ import pyperclip
 import threading
 import queue
 import keyring
-from datetime import datetime
+import asyncio
+import concurrent.futures
+from datetime import datetime, timedelta
 from tkinter import messagebox
 import tkinter as tk
+from typing import Optional, Dict, Any, Tuple
 
 try:
     import customtkinter as ctk
@@ -61,7 +64,7 @@ class SplashScreen:
 class DownloaderApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("安全云剪切板 (下载端) v5.8 - LocalSend风格")
+        self.root.title("安全云剪切板 (下载端) v5.9 - 性能优化版")
         self.password = None
         self.config_manager = ConfigManager()
         self.download_dir = "./downloads/"
@@ -83,6 +86,21 @@ class DownloaderApp:
             'warning': '#f59e0b',
             'text': '#0f172a',
             'text_secondary': '#64748b'
+        }
+        
+        # 性能优化配置
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="DownloaderWorker")
+        self.session = requests.Session()  # 复用连接
+        self.session.headers.update({'User-Agent': 'UpAndDown2-Client/5.9'})
+        
+        # 性能统计
+        self.stats = {
+            'total_downloads': 0,
+            'total_upload_time': 0.0,
+            'average_response_time': 0.0,
+            'last_response_time': 0.0,
+            'error_count': 0,
+            'start_time': time.time()
         }
         
         self.is_monitoring = threading.Event()
@@ -173,16 +191,69 @@ class DownloaderApp:
                 elif msg_type == 'update_count':
                     if hasattr(self, 'count_label'):
                         if CTK_AVAILABLE:
-                            self.count_label.configure(text=f"已下载: {self.download_count}")
+                            # 显示更详细的统计信息
+                            avg_time = self.stats['average_response_time']
+                            self.count_label.configure(text=f"已下载: {self.download_count} | 平均响应: {avg_time:.1f}ms")
                         else:
                             self.count_label.config(text=f"已下载: {self.download_count}")
+                            
+                elif msg_type == 'monitoring_started':
+                    # 监控启动完成的UI更新
+                    if CTK_AVAILABLE:
+                        self.start_button.configure(text="▶️  开始监控")
+                        self.status_label.configure(text="状态: 智能监控中...", text_color=self.colors['primary'])
+                        self.header_status.configure(text="监控中", fg_color=self.colors['primary'])
+                    else:
+                        self.start_button.config(text="▶️  开始监控")
+                        self.status_label.config(text="状态: 智能监控中...")
+                        
+                elif msg_type == 'monitoring_stopped':
+                    # 监控停止完成的UI更新
+                    if CTK_AVAILABLE:
+                        self.start_button.configure(state='normal')
+                        self.stop_button.configure(state='disabled', text="⏸️  停止监控")
+                        self.status_label.configure(text="状态: 已停止", text_color=self.colors['warning'])
+                        self.header_status.configure(text="已停止", fg_color=self.colors['warning'])
+                    else:
+                        self.start_button.config(state='normal')
+                        self.stop_button.config(state='disabled', text="⏸️  停止监控")
+                        self.status_label.config(text="状态: 已停止")
+                        
+                elif msg_type == 'monitoring_failed':
+                    # 监控启动失败的UI更新
+                    if CTK_AVAILABLE:
+                        self.start_button.configure(state='normal', text="▶️  开始监控")
+                        self.stop_button.configure(state='disabled')
+                        self.status_label.configure(text="状态: 启动失败", text_color=self.colors['danger'])
+                        self.header_status.configure(text="启动失败", fg_color=self.colors['danger'])
+                    else:
+                        self.start_button.config(state='normal', text="▶️  开始监控")
+                        self.stop_button.config(state='disabled')
+                        self.status_label.config(text="状态: 启动失败")
         except queue.Empty:
             pass
         self.root.after(100, self.process_queue)
 
     def on_closing(self):
+        """应用关闭时的清理工作"""
         if messagebox.askokcancel("退出", "确定要退出程序吗?"):
+            # 停止监控
             self.is_monitoring.clear()
+            
+            # 等待线程池关闭
+            try:
+                self.executor.shutdown(wait=True, timeout=5.0)
+                self.status_queue.put(('log', ("✅ 线程池已安全关闭", 'info')))
+            except Exception as e:
+                self.status_queue.put(('log', (f"⚠️ 线程池关闭异常: {e}", 'warning')))
+            
+            # 关闭网络会话
+            try:
+                self.session.close()
+                self.status_queue.put(('log', ("✅ 网络会话已关闭", 'info')))
+            except Exception as e:
+                self.status_queue.put(('log', (f"⚠️ 会话关闭异常: {e}", 'warning')))
+            
             self.root.destroy()
 
     def setup_styles(self):
@@ -501,7 +572,28 @@ class DownloaderApp:
             self.log_area.see(tk.END)
 
     def start_monitoring(self):
+        """启动监控 - 毫秒级响应优化"""
         if not self.is_monitoring.is_set():
+            # 立即UI反馈（毫秒级响应）
+            if CTK_AVAILABLE:
+                self.start_button.configure(state='disabled', text="⏳ 启动中...")
+                self.stop_button.configure(state='normal')
+                self.status_label.configure(text="状态: 正在启动...", text_color=self.colors['warning'])
+                self.header_status.configure(text="启动中", fg_color=self.colors['warning'])
+            else:
+                self.start_button.config(state='disabled', text="⏳ 启动中...")
+                self.stop_button.config(state='normal')
+                self.status_label.config(text="状态: 正在启动...")
+            
+            # 立即强制UI更新
+            self.root.update_idletasks()
+            
+            # 异步执行实际启动逻辑
+            self.executor.submit(self._start_monitoring_async)
+    
+    def _start_monitoring_async(self):
+        """异步启动监控逻辑"""
+        try:
             # 重置轮询状态
             self.current_poll_interval = self.base_poll_interval
             self.consecutive_empty_polls = 0
@@ -509,45 +601,79 @@ class DownloaderApp:
             
             self.is_monitoring.set()
             
-            # 更新按钮状态和样式
-            if CTK_AVAILABLE:
-                self.start_button.configure(state='disabled')
-                self.stop_button.configure(state='normal')
-                self.status_label.configure(text="状态: 智能监控中...", text_color=self.colors['primary'])
-                self.header_status.configure(text="监控中", fg_color=self.colors['primary'])
-            else:
-                self.start_button.config(state='disabled')
-                self.stop_button.config(state='normal')
-                self.status_label.config(text="状态: 智能监控中...")
+            # 更新UI状态
+            self.status_queue.put(('monitoring_started', None))
             
+            # 启动监控线程
             self.monitor_thread = threading.Thread(target=self.monitor_files_worker, daemon=True)
             self.monitor_thread.start()
-            self.status_queue.put(('log', (f"智能监控已启动，初始间隔: {self.base_poll_interval}s", 'success')))
+            
+            self.status_queue.put(('log', (f"🚀 智能监控已启动，初始间隔: {self.base_poll_interval}s", 'success')))
+            
+        except Exception as e:
+            self.status_queue.put(('log', (f"❌ 启动监控失败: {e}", 'error')))
+            self.status_queue.put(('monitoring_failed', None))
 
     def stop_monitoring(self):
+        """停止监控 - 毫秒级响应优化"""
         if self.is_monitoring.is_set():
+            # 立即UI反馈（毫秒级响应）
+            if CTK_AVAILABLE:
+                self.stop_button.configure(state='disabled', text="⏳ 停止中...")
+                self.status_label.configure(text="状态: 正在停止...", text_color=self.colors['warning'])
+                self.header_status.configure(text="停止中", fg_color=self.colors['warning'])
+            else:
+                self.stop_button.config(state='disabled', text="⏳ 停止中...")
+                self.status_label.config(text="状态: 正在停止...")
+            
+            # 立即强制UI更新
+            self.root.update_idletasks()
+            
+            # 异步执行实际停止逻辑
+            self.executor.submit(self._stop_monitoring_async)
+    
+    def _stop_monitoring_async(self):
+        """异步停止监控逻辑"""
+        try:
             self.is_monitoring.clear()
             
-            # 更新按钮状态和样式
-            if CTK_AVAILABLE:
-                self.start_button.configure(state='normal')
-                self.stop_button.configure(state='disabled')
-                self.status_label.configure(text="状态: 已停止", text_color=self.colors['warning'])
-                self.header_status.configure(text="已停止", fg_color=self.colors['warning'])
-            else:
-                self.start_button.config(state='normal')
-                self.stop_button.config(state='disabled')
-                self.status_label.config(text="状态: 已停止")
+            # 等待监控线程结束（最多3秒）
+            if self.monitor_thread and self.monitor_thread.is_alive():
+                self.monitor_thread.join(timeout=3.0)
             
             # 显示智能轮询统计信息
-            stats_msg = f"监控已停止，等待当前轮询结束... [统计: 连续空轮询{self.consecutive_empty_polls}次, 当前间隔{self.current_poll_interval:.1f}s]"
+            uptime = time.time() - self.stats['start_time']
+            stats_msg = f"📊 监控已停止 [运行时间: {uptime:.1f}s, 下载: {self.stats['total_downloads']}, 错误: {self.stats['error_count']}]"
+            
+            self.status_queue.put(('monitoring_stopped', None))
             self.status_queue.put(('log', (stats_msg, 'warning')))
+            
+        except Exception as e:
+            self.status_queue.put(('log', (f"❌ 停止监控异常: {e}", 'error')))
 
     def open_download_folder(self):
-        try:
-            os.startfile(os.path.abspath(self.download_dir))
-        except Exception as e:
-            messagebox.showerror("错误", f"无法打开文件夹: {e}")
+        """打开下载文件夹 - 异步优化"""
+        # 立即UI反馈
+        if CTK_AVAILABLE:
+            original_text = self.open_folder_button.cget("text")
+            self.open_folder_button.configure(text="📂 打开中...")
+        
+        # 立即强制UI更新
+        self.root.update_idletasks()
+        
+        # 异步执行文件夹打开
+        def open_folder_async():
+            try:
+                os.startfile(os.path.abspath(self.download_dir))
+                self.status_queue.put(('log', (f"📁 已打开下载文件夹: {self.download_dir}", 'info')))
+            except Exception as e:
+                self.status_queue.put(('log', (f"❌ 无法打开文件夹: {e}", 'error')))
+            finally:
+                # 恢复按钮文本
+                if CTK_AVAILABLE:
+                    self.root.after(500, lambda: self.open_folder_button.configure(text=original_text))
+        
+        self.executor.submit(open_folder_async)
 
     def clear_log(self):
         if CTK_AVAILABLE and hasattr(self.log_area, 'configure'):
@@ -609,12 +735,26 @@ class DownloaderApp:
         self.status_queue.put(('log', ("智能轮询线程已安全退出", 'info')))
 
     def process_files(self):
-        """处理文件检查，返回是否找到文件"""
+        """处理文件检查，返回是否找到文件 - 带性能监控"""
+        start_time = time.time()
         config = self.config_manager.get_config()
-        headers = {'Cookie': config['DEFAULT']['COOKIE'], 'User-Agent': 'Mozilla/5.0'}
+        
         try:
-            response = requests.post(config['DEFAULT']['QUERY_URL'], headers=headers, timeout=30)
+            # 使用会话复用连接
+            headers = {'Cookie': config['DEFAULT']['COOKIE']}
+            response = self.session.post(config['DEFAULT']['QUERY_URL'], headers=headers, timeout=30)
             response.raise_for_status()
+            
+            # 计算响应时间
+            response_time_ms = (time.time() - start_time) * 1000
+            self.stats['last_response_time'] = response_time_ms
+            
+            # 更新平均响应时间
+            if self.stats['average_response_time'] == 0:
+                self.stats['average_response_time'] = response_time_ms
+            else:
+                self.stats['average_response_time'] = (self.stats['average_response_time'] + response_time_ms) / 2
+            
             data = response.json()
             items = data.get("items", [])
             
@@ -633,95 +773,197 @@ class DownloaderApp:
                     self.handle_single_file(item, config, headers)
                     files_processed += 1
             
+            if files_processed > 0:
+                self.stats['total_downloads'] += files_processed
+            
             return files_processed > 0  # 返回是否处理了文件
             
         except Exception as e:
-            self.status_queue.put(('log', (f"轮询时发生错误: {e}", 'error')))
+            self.stats['error_count'] += 1
+            error_msg = f"🌐 网络请求失败 [响应时间: {(time.time() - start_time)*1000:.1f}ms]: {e}"
+            self.status_queue.put(('log', (error_msg, 'error')))
             return False  # 错误时返回未找到文件
 
     def handle_single_file(self, item, config, headers):
+        """处理单个文件 - 异步优化版本"""
+        # 异步执行文件下载和处理
+        self.executor.submit(self._handle_single_file_async, item, config, headers)
+    
+    def _handle_single_file_async(self, item, config, headers):
+        """异步处理单个文件"""
+        start_time = time.time()
         try:
             dl_url = config['DEFAULT']['BASE_DOWNLOAD_URL'] + item['fileUrl']
-            dl_response = requests.get(dl_url, headers=headers, timeout=120)
-            if dl_response.status_code != 200: return
+            
+            # 使用会话进行下载
+            dl_response = self.session.get(dl_url, headers=headers, timeout=120)
+            if dl_response.status_code != 200: 
+                return
+                
+            # 解密和解析
             payload = decrypt_and_parse_payload(dl_response.content, self.password)
             content = base64.b64decode(payload['content_base64'])
+            
+            download_time_ms = (time.time() - start_time) * 1000
+            
             if payload.get('is_from_text', False):
+                # 文本内容复制到剪切板
                 pyperclip.copy(content.decode('utf-8'))
-                self.status_queue.put(('log', (f"文本内容 '{payload['filename']}' 已复制到剪切板。", 'success')))
+                self.status_queue.put(('log', (f"📝 文本内容 '{payload['filename']}' 已复制到剪切板 [{download_time_ms:.1f}ms]", 'success')))
             else:
+                # 文件保存
                 save_path = os.path.join(self.download_dir, payload['filename'])
                 with open(save_path, 'wb') as f:
                     f.write(content)
                 pyperclip.copy(os.path.abspath(save_path))
-                self.status_queue.put(('log', (f"文件 '{payload['filename']}' 已下载并复制路径。", 'success')))
+                file_size_kb = len(content) / 1024
+                self.status_queue.put(('log', (f"📁 文件 '{payload['filename']}' 已下载 [{file_size_kb:.1f}KB, {download_time_ms:.1f}ms]", 'success')))
+            
+            # 更新统计
             self.download_count += 1
+            self.stats['total_downloads'] += 1
             self.status_queue.put(('update_count', ''))
-            threading.Thread(target=delete_server_file, args=(item['id'], config, self.status_queue), daemon=True).start()
+            
+            # 异步删除服务器文件
+            self.executor.submit(delete_server_file, item['id'], config, self.status_queue)
+            
         except Exception as e:
-            self.status_queue.put(('log', (f"处理单个文件时出错: {e}", 'error')))
+            self.stats['error_count'] += 1
+            self.status_queue.put(('log', (f"❌ 处理单个文件失败: {e}", 'error')))
 
     def handle_chunk(self, item, config, headers):
+        """处理分片文件 - 异步优化版本"""
+        # 异步执行分片下载和处理
+        self.executor.submit(self._handle_chunk_async, item, config, headers)
+    
+    def _handle_chunk_async(self, item, config, headers):
+        """异步处理分片文件"""
+        start_time = time.time()
         try:
             file_id, file_name = item['id'], item['name']
             match = re.match(r"chunk_([^_]+)_(\d+)_(\d+)_(.+)\.encrypted", file_name)
-            if not match: return
+            if not match: 
+                return
+                
             upload_id, chunk_index_str, total_chunks_str, encoded_filename = match.groups()
             original_filename = urllib.parse.unquote(encoded_filename)
             chunk_index, total_chunks = int(chunk_index_str), int(total_chunks_str)
-            self.status_queue.put(('log', (f"下载分片 {chunk_index}/{total_chunks} for {original_filename}", 'info')))
+            
+            self.status_queue.put(('log', (f"📦 下载分片 {chunk_index}/{total_chunks} for {original_filename}", 'info')))
+            
+            # 使用会话下载分片
             dl_url = config['DEFAULT']['BASE_DOWNLOAD_URL'] + item['fileUrl']
-            dl_response = requests.get(dl_url, headers=headers, timeout=300)
-            if dl_response.status_code != 200: return
+            dl_response = self.session.get(dl_url, headers=headers, timeout=300)
+            if dl_response.status_code != 200: 
+                return
+                
+            # 解密分片内容
             payload = decrypt_and_parse_payload(dl_response.content, self.password)
             chunk_content = base64.b64decode(payload['content_base64'])
+            
+            download_time_ms = (time.time() - start_time) * 1000
+            chunk_size_kb = len(chunk_content) / 1024
+            
+            # 保存分片文件
             upload_temp_dir = os.path.join(self.temp_chunk_dir, upload_id)
             if not os.path.exists(upload_temp_dir):
                 try:
                     os.makedirs(upload_temp_dir)
                 except FileExistsError:
                     pass
+            
             chunk_file_path = os.path.join(upload_temp_dir, f"{chunk_index:03d}.chunk")
             with open(chunk_file_path, 'wb') as f:
                 f.write(chunk_content)
-            threading.Thread(target=delete_server_file, args=(file_id, config, self.status_queue), daemon=True).start()
+            
+            self.status_queue.put(('log', (f"✅ 分片 {chunk_index}/{total_chunks} 已保存 [{chunk_size_kb:.1f}KB, {download_time_ms:.1f}ms]", 'success')))
+            
+            # 异步删除服务器文件
+            self.executor.submit(delete_server_file, file_id, config, self.status_queue)
+            
+            # 检查是否可以合并文件（使用锁保证线程安全）
             with self.locks_lock:
                 if upload_id not in self.merge_locks:
                     self.merge_locks[upload_id] = threading.Lock()
                 merge_lock = self.merge_locks[upload_id]
+            
             with merge_lock:
-                if not os.path.exists(upload_temp_dir): return
+                if not os.path.exists(upload_temp_dir): 
+                    return
                 if len(os.listdir(upload_temp_dir)) == total_chunks:
-                    self.merge_chunks(upload_id, total_chunks, original_filename)
+                    # 异步合并文件
+                    self.executor.submit(self._merge_chunks_async, upload_id, total_chunks, original_filename)
+                    
         except Exception as e:
-            self.status_queue.put(('log', (f"处理分片时出错: {e}", 'error')))
+            self.stats['error_count'] += 1
+            self.status_queue.put(('log', (f"❌ 处理分片失败: {e}", 'error')))
 
-    def merge_chunks(self, upload_id, total_chunks, original_filename):
-        self.status_queue.put(('log', (f"所有分片接收完毕，开始合并: {original_filename}", 'success')))
+    def _merge_chunks_async(self, upload_id, total_chunks, original_filename):
+        """异步合并分片文件"""
+        start_time = time.time()
+        self.status_queue.put(('log', (f"🔄 开始合并分片: {original_filename} ({total_chunks} 个分片)", 'info')))
+        
         upload_temp_dir = os.path.join(self.temp_chunk_dir, upload_id)
         final_path = os.path.join(self.download_dir, original_filename)
+        
         try:
-            time.sleep(0.5)
+            # 短暂等待确保所有分片都已写入完成
+            time.sleep(0.1)
+            
             if not os.path.isdir(upload_temp_dir):
-                self.status_queue.put(('log', (f"合并任务已由其他线程完成: {original_filename}", 'warning')))
+                self.status_queue.put(('log', (f"⚠️ 合并任务已由其他线程完成: {original_filename}", 'warning')))
                 return
+            
+            total_size = 0
+            # 高效的文件合并
             with open(final_path, 'wb') as final_file:
                 for i in range(total_chunks):
                     chunk_index = i + 1
                     chunk_file_path = os.path.join(upload_temp_dir, f"{chunk_index:03d}.chunk")
+                    
+                    if not os.path.exists(chunk_file_path):
+                        raise FileNotFoundError(f"分片文件缺失: {chunk_file_path}")
+                    
+                    # 分块读取以节省内存
                     with open(chunk_file_path, 'rb') as chunk_file:
-                        final_file.write(chunk_file.read())
+                        while True:
+                            chunk_data = chunk_file.read(8192)  # 8KB块
+                            if not chunk_data:
+                                break
+                            final_file.write(chunk_data)
+                            total_size += len(chunk_data)
+            
+            # 复制路径到剪切板
             pyperclip.copy(os.path.abspath(final_path))
-            self.status_queue.put(('log', (f"文件合并成功: {final_path}，路径已复制。", 'success')))
+            
+            merge_time_ms = (time.time() - start_time) * 1000
+            file_size_mb = total_size / (1024 * 1024)
+            
+            self.status_queue.put(('log', (f"🎉 文件合并成功: '{original_filename}' [{file_size_mb:.2f}MB, {merge_time_ms:.1f}ms]", 'success')))
+            
+            # 更新统计
             self.download_count += 1
+            self.stats['total_downloads'] += 1
             self.status_queue.put(('update_count', ''))
+            
         except Exception as e:
-            self.status_queue.put(('log', (f"合并文件时出错: {e}", 'error')))
+            self.stats['error_count'] += 1
+            self.status_queue.put(('log', (f"❌ 合并文件失败: {e}", 'error')))
         finally:
+            # 清理临时文件夹
             if os.path.exists(upload_temp_dir):
-                shutil.rmtree(upload_temp_dir, ignore_errors=True)
+                try:
+                    shutil.rmtree(upload_temp_dir, ignore_errors=True)
+                except Exception as e:
+                    self.status_queue.put(('log', (f"⚠️ 清理临时文件失败: {e}", 'warning')))
+            
+            # 清理锁
             with self.locks_lock:
                 self.merge_locks.pop(upload_id, None)
+
+    def merge_chunks(self, upload_id, total_chunks, original_filename):
+        """保持向后兼容的合并方法"""
+        self._merge_chunks_async(upload_id, total_chunks, original_filename)
 
 def main():
     root = None
