@@ -1,0 +1,33 @@
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE和编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude私有配置
+.claude/
+
+# 临时文件
+*.tmp
+*.temp
+
+# 下载文件夹（包含用户数据）
+downloads/
+
+# 日志文件
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
