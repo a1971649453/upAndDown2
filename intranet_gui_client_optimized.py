@@ -163,12 +163,14 @@ class OptimizedClipboardUploader:
         """初始化配置系统"""
         try:
             self.config_manager = ConfigManager()
-            config = self.config_manager.get_config()
-            self.max_file_size_mb = int(config['DEFAULT'].get('MAX_FILE_SIZE_MB', 6))
-            self.chunk_size_mb = int(config['DEFAULT'].get('CHUNK_SIZE_MB', 3)) 
+            # 修复1: 必须先调用load_config()才能读取配置文件
+            config = self.config_manager.load_config()
+            # 修复2: 使用小写键名匹配配置文件中的实际键名
+            self.max_file_size_mb = int(config['DEFAULT'].get('max_file_size_mb', 6))
+            self.chunk_size_mb = int(config['DEFAULT'].get('chunk_size_mb', 3)) 
             self.max_file_size_bytes = self.max_file_size_mb * 1024 * 1024
             self.chunk_size_bytes = self.chunk_size_mb * 1024 * 1024
-            self.poll_interval = float(config['DEFAULT'].get('POLL_INTERVAL_SECONDS', 10))
+            self.poll_interval = float(config['DEFAULT'].get('poll_interval_seconds', 10))
             
             self._log_message(f"配置加载成功: 文件限制{self.max_file_size_mb}MB, 分块{self.chunk_size_mb}MB", 'info')
         except Exception as e:

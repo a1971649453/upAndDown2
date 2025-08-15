@@ -26,9 +26,9 @@ class FileUploadService:
         self.config_manager = config_manager or ConfigManager()
         
         # 从配置加载参数
-        config = self.config_manager.get_config()
-        self.max_file_size_mb = int(config['DEFAULT'].get('MAX_FILE_SIZE_MB', 50))
-        self.chunk_size_mb = int(config['DEFAULT'].get('CHUNK_SIZE_MB', 45))
+        config = self.config_manager.load_config()
+        self.max_file_size_mb = int(config['DEFAULT'].get('max_file_size_mb', 50))
+        self.chunk_size_mb = int(config['DEFAULT'].get('chunk_size_mb', 45))
         self.max_file_size_bytes = self.max_file_size_mb * 1024 * 1024
         self.chunk_size_bytes = self.chunk_size_mb * 1024 * 1024
         
