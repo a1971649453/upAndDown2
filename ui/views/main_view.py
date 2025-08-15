@@ -60,26 +60,31 @@ class MainView:
     
     def _create_desktop_layout(self, container):
         """创建桌面端布局（左右分栏）"""
+        # 使用网格布局替代pack，更好控制比例
+        container.grid_columnconfigure(0, weight=1, minsize=320)  # 左侧面板最小宽度320px
+        container.grid_columnconfigure(1, weight=2)  # 右侧面板权重更高，给活动日志更多空间
+        container.grid_rowconfigure(0, weight=1)
+        
         if CTK_AVAILABLE:
             # 左侧面板
             left_panel = ctk.CTkFrame(container, fg_color="transparent")
-            left_panel.pack(side='left', fill='both', expand=False, padx=(0, 4))
+            left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
             
             # 右侧面板
             right_panel = ctk.CTkFrame(container, fg_color="transparent")
-            right_panel.pack(side='right', fill='both', expand=True, padx=(4, 0))
+            right_panel.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         else:
-            # 传统Tkinter版本
+            # 传统版本
             left_panel = tk.Frame(container, bg=self.theme_manager.get_color('background'))
-            left_panel.pack(side='left', fill='both', expand=False, padx=(0, 4))
+            left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
             
             right_panel = tk.Frame(container, bg=self.theme_manager.get_color('background'))
-            right_panel.pack(side='right', fill='both', expand=True, padx=(4, 0))
+            right_panel.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
         
         # 创建左侧组件
         self._create_left_panel_components(left_panel)
         
-        # 创建右侧组件
+        # 创建右侧组件（确保有足够的展开空间）
         self._create_right_panel_components(right_panel)
     
     def _create_mobile_layout(self, container):
@@ -90,17 +95,17 @@ class MainView:
     
     def _create_left_panel_components(self, parent):
         """创建左侧面板组件"""
-        # 拖拽上传区域
-        self.drag_drop_frame = DragDropFrame(parent, self.theme_manager, self._on_files_dropped)
-        self.drag_drop_frame.pack(fill='x', pady=(0, 8))
-        
-        # 文件上传卡片
+        # 使用统一的文件上传卡片（包含拖拽功能），移除重复的拖拽区域
         self.upload_card = FileUploadCard(parent, self.theme_manager)
         self.upload_card.pack(fill='x', pady=(0, 8))
         
         # 绑定上传卡片事件
         self.upload_card.set_select_command(self._on_select_files)
         self.upload_card.set_upload_command(self._on_upload_files)
+        # 绑定拖拽事件到上传卡片
+        if hasattr(self.upload_card, 'drop_area'):
+            # 为上传卡片的拖拽区域设置事件处理
+            self.upload_card._setup_drag_drop_events(self._on_files_dropped)
         
         # 一键上传按钮
         self.one_click_upload = OneClickUpload(parent, self.theme_manager, self._on_one_click_upload)

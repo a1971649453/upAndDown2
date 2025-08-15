@@ -37,14 +37,14 @@ class ThemeManager:
             'secondary': '#2d2d2d',
             'surface': '#1e1e1e',
             'background': '#161616',
-            'text_primary': '#ffffff',
-            'text_secondary': '#cccccc',
+            'text_primary': '#f5f5f5',  # 提高对比度：更亮的白色
+            'text_secondary': '#d0d0d0',  # 提高对比度：更亮的灰色
             'border': '#404040',
-            'success': '#107c10',
-            'warning': '#ff8c00',
-            'error': '#d83b01',
+            'success': '#10ac10',  # 稍微增加亮度
+            'warning': '#ffaa33',  # 稍微增加亮度
+            'error': '#ff6b6b',    # 稍微增加亮度
             'card_bg': '#2d2d2d',
-            'card_border': '#404040',
+            'card_border': '#505050',  # 增加边框对比度
         }
     }
     

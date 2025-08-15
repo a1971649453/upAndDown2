@@ -154,6 +154,9 @@ class MainController:
             
             self.clipboard_service.update_settings(text_enabled, file_enabled)
             
+        except Exception as e:
+            self.view.add_status_message(f"监控设置更新失败: {e}", "error")
+            
     def on_files_dropped(self, file_paths: List[str]):
         """处理拖拽文件"""
         try:

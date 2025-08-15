@@ -13,6 +13,7 @@ except ImportError:
 
 from ..themes.theme_manager import ThemeManager
 from .base_components import ModernFrame, ModernLabel, ModernButton
+from .drag_drop import DragDropMixin
 
 class FileUploadCard:
     """文件上传卡片组件 - LocalSend风格"""
@@ -115,6 +116,26 @@ class FileUploadCard:
         # 存储按钮引用
         self.select_button = select_btn
         self.upload_button = upload_btn
+        
+        # 初始化拖拽功能
+        self._setup_drag_drop()
+        
+    def _setup_drag_drop(self):
+        """为上传卡片设置拖拽功能"""
+        try:
+            self.drag_drop = DragDropMixin(self.drop_area, self._handle_dropped_files)
+        except Exception as e:
+            print(f"拖拽功能初始化失败: {e}")
+            self.drag_drop = None
+    
+    def _handle_dropped_files(self, files):
+        """处理拖拽文件"""
+        if hasattr(self, '_drag_callback') and self._drag_callback:
+            self._drag_callback(files)
+    
+    def _setup_drag_drop_events(self, callback):
+        """设置拖拽事件回调（由MainView调用）"""
+        self._drag_callback = callback
     
     def _create_traditional_layout(self):
         """传统Tkinter版本的布局"""
@@ -248,16 +269,48 @@ class StatusCard:
             )
             self.title_label.pack(fill=tk.X, padx=16, pady=(16, 8))
             
-            # 创建滚动区域
+            # 创建滚动区域（修复版）
             canvas_frame = tk.Frame(main_widget, bg=self.theme_manager.get_color('card_bg'))
             canvas_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
             
-            # 这里可以添加scrollbar和canvas的实现
-            self.content_frame = tk.Frame(
+            # 创建画布和滚动条
+            canvas = tk.Canvas(
                 canvas_frame, 
+                bg=self.theme_manager.get_color('card_bg'),
+                highlightthickness=0
+            )
+            scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
+            
+            self.content_frame = tk.Frame(
+                canvas, 
                 bg=self.theme_manager.get_color('card_bg')
             )
-            self.content_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # 布局画布和滚动条
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            
+            # 创建滚动窗口
+            canvas_window = canvas.create_window((0, 0), window=self.content_frame, anchor="nw")
+            
+            # 绑定滚动事件
+            def configure_scroll_region(event=None):
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                # 确保内容框架宽度与画布一致
+                canvas_width = canvas.winfo_width()
+                canvas.itemconfig(canvas_window, width=canvas_width)
+            
+            self.content_frame.bind("<Configure>", configure_scroll_region)
+            canvas.bind("<Configure>", configure_scroll_region)
+            
+            # 绑定鼠标滚轮事件
+            def _on_mousewheel(event):
+                canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            
+            canvas.bind("<MouseWheel>", _on_mousewheel)  # Windows
+            canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))  # Linux
+            canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))   # Linux
     
     def add_status_item(self, message, status_type='info'):
         """添加状态项"""
