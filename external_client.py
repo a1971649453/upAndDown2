@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from tkinter import messagebox
 import tkinter as tk
 from typing import Optional, Dict, Any, Tuple
+from collections import deque # Added for clipboard protection
 
 try:
     import customtkinter as ctk
@@ -30,6 +31,47 @@ import urllib.parse
 
 from config_manager import ConfigManager, run_cookie_server
 from network_utils import decrypt_and_parse_payload, delete_server_file
+
+
+def safe_operation(operation_name="操作"):
+    """异常处理装饰器，用于安全地执行可能失败的操作"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # 获取调用者信息
+                caller = func.__name__ if hasattr(func, '__name__') else 'unknown'
+                error_msg = f"❌ {operation_name}失败 [{caller}]: {str(e)}"
+                
+                # 添加详细错误信息
+                if hasattr(e, '__traceback__'):
+                    import traceback
+                    try:
+                        tb_info = traceback.format_exc()
+                        # 提取关键错误信息
+                        lines = tb_info.split('\n')
+                        error_details = []
+                        for line in lines:
+                            if 'File "' in line and '.py' in line:
+                                error_details.append(line.strip())
+                            elif 'Error:' in line or 'Exception:' in line:
+                                error_details.append(line.strip())
+                        
+                        if error_details:
+                            error_msg += f"\n   错误详情: {' | '.join(error_details[:3])}"
+                    except:
+                        pass
+                
+                # 记录错误到日志
+                if args and hasattr(args[0], 'status_queue'):
+                    args[0].status_queue.put(('log', (error_msg, 'error')))
+                else:
+                    print(error_msg)
+                
+                return None
+        return wrapper
+    return decorator
 
 
 # --- 加载屏类 (无变化) ---
@@ -78,6 +120,10 @@ class DownloaderApp:
         self.consecutive_empty_polls = 0  # 连续空轮询计数
         self.auto_stop_minutes = 10  # 10分钟无文件自动停止
         
+        # 文件过滤配置
+        self.min_file_size = 100  # 最小文件大小（字节）
+        self.auto_delete_invalid = True  # 自动删除无效文件
+        
         # 初始化设计系统颜色（默认值，会在setup_styles中更新）
         self.colors = {
             'primary': '#3b82f6',
@@ -101,6 +147,18 @@ class DownloaderApp:
             'last_response_time': 0.0,
             'error_count': 0,
             'start_time': time.time()
+        }
+        
+        # 剪切板循环防护机制
+        self.clipboard_protection = {
+            'last_clipboard_content': '',  # 上次剪切板内容
+            'last_clipboard_time': 0,      # 上次剪切板时间
+            'clipboard_change_count': 0,   # 剪切板变化计数
+            'min_interval_seconds': 2.0,   # 最小间隔2秒
+            'max_changes_per_minute': 10,  # 每分钟最大变化次数
+            'change_timestamps': deque(maxlen=60),  # 变化时间戳记录
+            'is_self_operation': False,    # 是否是自己操作
+            'operation_lock': threading.Lock()  # 操作锁
         }
         
         self.is_monitoring = threading.Event()
@@ -142,8 +200,13 @@ class DownloaderApp:
             self.poll_increase_factor = float(config['DEFAULT'].get('POLL_INCREASE_FACTOR', 1.5))
             self.auto_stop_minutes = int(config['DEFAULT'].get('AUTO_STOP_MINUTES', 10))
             
+            # 加载文件过滤配置
+            self.min_file_size = int(config['DEFAULT'].get('MIN_FILE_SIZE', 100))
+            self.auto_delete_invalid = config['DEFAULT'].get('AUTO_DELETE_INVALID', 'True').lower() == 'true'
+            
             # 记录智能轮询配置
             self.status_queue.put(('log', (f'智能轮询配置加载: 基础间隔={self.base_poll_interval}s, 最大间隔={self.max_poll_interval}s, 递增因子={self.poll_increase_factor}, 自动停止={self.auto_stop_minutes}分钟', 'info')))
+            self.status_queue.put(('log', (f'文件过滤配置加载: 最小文件大小={self.min_file_size}字节, 自动删除无效文件={self.auto_delete_invalid}', 'info')))
             
             if not os.path.exists(self.download_dir): os.makedirs(self.download_dir)
             if not os.path.exists(self.temp_chunk_dir): os.makedirs(self.temp_chunk_dir)
@@ -171,7 +234,8 @@ class DownloaderApp:
                     if CTK_AVAILABLE:
                         self.start_button.configure(state='normal')
                         self.status_label.configure(text="状态: 已就绪", text_color=self.colors['success'])
-                        self.header_status.configure(text="已就绪", fg_color=self.colors['success'])
+                        self.status_indicator.configure(fg_color=self.colors['success_light'])
+                        self.header_status.configure(text="已就绪", text_color=self.colors['success'])
                     else:
                         self.start_button.config(state='normal')
                         self.status_label.config(text="状态: 已就绪")
@@ -181,7 +245,8 @@ class DownloaderApp:
                     messagebox.showerror("启动错误", message)
                     if CTK_AVAILABLE:
                         self.status_label.configure(text="状态: 启动失败", text_color=self.colors['danger'])
-                        self.header_status.configure(text="启动失败", fg_color=self.colors['danger'])
+                        self.status_indicator.configure(fg_color=self.colors['danger'])
+                        self.header_status.configure(text="启动失败", text_color="white")
                     else:
                         self.status_label.config(text="状态: 启动失败")
                 elif msg_type == 'log':
@@ -201,8 +266,9 @@ class DownloaderApp:
                     # 监控启动完成的UI更新
                     if CTK_AVAILABLE:
                         self.start_button.configure(text="▶️  开始监控")
-                        self.status_label.configure(text="状态: 智能监控中...", text_color=self.colors['primary'])
-                        self.header_status.configure(text="监控中", fg_color=self.colors['primary'])
+                        self.status_label.configure(text="状态: 智能监控中...", text_color=self.colors['success'])
+                        self.status_indicator.configure(fg_color=self.colors['success_light'])
+                        self.header_status.configure(text="监控中", text_color=self.colors['success'])
                     else:
                         self.start_button.config(text="▶️  开始监控")
                         self.status_label.config(text="状态: 智能监控中...")
@@ -213,7 +279,8 @@ class DownloaderApp:
                         self.start_button.configure(state='normal')
                         self.stop_button.configure(state='disabled', text="⏸️  停止监控")
                         self.status_label.configure(text="状态: 已停止", text_color=self.colors['warning'])
-                        self.header_status.configure(text="已停止", fg_color=self.colors['warning'])
+                        self.status_indicator.configure(fg_color=self.colors['warning_light'])
+                        self.header_status.configure(text="已停止", text_color=self.colors['warning'])
                     else:
                         self.start_button.config(state='normal')
                         self.stop_button.config(state='disabled', text="⏸️  停止监控")
@@ -225,7 +292,8 @@ class DownloaderApp:
                         self.start_button.configure(state='normal', text="▶️  开始监控")
                         self.stop_button.configure(state='disabled')
                         self.status_label.configure(text="状态: 启动失败", text_color=self.colors['danger'])
-                        self.header_status.configure(text="启动失败", fg_color=self.colors['danger'])
+                        self.status_indicator.configure(fg_color=self.colors['danger'])
+                        self.header_status.configure(text="启动失败", text_color="white")
                     else:
                         self.start_button.config(state='normal', text="▶️  开始监控")
                         self.stop_button.config(state='disabled')
@@ -268,6 +336,10 @@ class DownloaderApp:
                 'primary_hover': '#2563eb', # 深蓝悬停
                 'success': '#10b981',       # 绿色成功
                 'success_hover': '#059669', # 深绿悬停
+                'success_light': '#d1fae5', # 浅绿色（监控中状态）
+                'success_light_hover': '#a7f3d0', # 浅绿悬停
+                'warning_light': '#fef3c7', # 浅橙色（启动中/停止中状态）
+                'warning_light_hover': '#fde68a', # 浅橙悬停
                 'danger': '#ef4444',        # 红色危险
                 'danger_hover': '#dc2626',  # 深红悬停
                 'warning': '#f59e0b',       # 橙色警告
@@ -342,17 +414,17 @@ class DownloaderApp:
         subtitle_label.pack(anchor="w", pady=(4, 0))
         
         # 右侧状态指示器
-        status_indicator = ctk.CTkFrame(header_content, 
-                                       corner_radius=12, 
-                                       fg_color=self.colors['warning'],
-                                       width=120, height=40)
-        status_indicator.pack(side=tk.RIGHT, fill=tk.Y)
-        status_indicator.pack_propagate(False)
+        self.status_indicator = ctk.CTkFrame(header_content, 
+                                            corner_radius=12, 
+                                            fg_color=self.colors['warning_light'],
+                                            width=120, height=40)
+        self.status_indicator.pack(side=tk.RIGHT, fill=tk.Y)
+        self.status_indicator.pack_propagate(False)
         
-        self.header_status = ctk.CTkLabel(status_indicator, 
+        self.header_status = ctk.CTkLabel(self.status_indicator, 
                                          text="初始化中", 
                                          font=ctk.CTkFont(family="SF Pro Display", size=12, weight="bold"),
-                                         text_color="white")
+                                         text_color=self.colors['warning'])
         self.header_status.pack(expand=True)
         
         # 控制面板卡片
@@ -579,7 +651,8 @@ class DownloaderApp:
                 self.start_button.configure(state='disabled', text="⏳ 启动中...")
                 self.stop_button.configure(state='normal')
                 self.status_label.configure(text="状态: 正在启动...", text_color=self.colors['warning'])
-                self.header_status.configure(text="启动中", fg_color=self.colors['warning'])
+                self.status_indicator.configure(fg_color=self.colors['warning_light'])
+                self.header_status.configure(text="启动中", text_color=self.colors['warning'])
             else:
                 self.start_button.config(state='disabled', text="⏳ 启动中...")
                 self.stop_button.config(state='normal')
@@ -621,7 +694,8 @@ class DownloaderApp:
             if CTK_AVAILABLE:
                 self.stop_button.configure(state='disabled', text="⏳ 停止中...")
                 self.status_label.configure(text="状态: 正在停止...", text_color=self.colors['warning'])
-                self.header_status.configure(text="停止中", fg_color=self.colors['warning'])
+                self.status_indicator.configure(fg_color=self.colors['warning_light'])
+                self.header_status.configure(text="停止中", text_color=self.colors['warning'])
             else:
                 self.stop_button.config(state='disabled', text="⏳ 停止中...")
                 self.status_label.config(text="状态: 正在停止...")
@@ -789,33 +863,81 @@ class DownloaderApp:
         # 异步执行文件下载和处理
         self.executor.submit(self._handle_single_file_async, item, config, headers)
     
+    @safe_operation("文件处理")
     def _handle_single_file_async(self, item, config, headers):
         """异步处理单个文件"""
         start_time = time.time()
         try:
+            # 添加调试信息
+            self.status_queue.put(('log', (f"🔍 开始处理文件: {item.get('name', 'unknown')} (ID: {item.get('id', 'unknown')})", 'info')))
+            
             dl_url = config['DEFAULT']['BASE_DOWNLOAD_URL'] + item['fileUrl']
+            self.status_queue.put(('log', (f"🔗 下载URL: {dl_url}", 'info')))
             
             # 使用会话进行下载
             dl_response = self.session.get(dl_url, headers=headers, timeout=120)
             if dl_response.status_code != 200: 
+                self.status_queue.put(('log', (f"❌ 下载失败，HTTP状态码: {dl_response.status_code}", 'error')))
+                return
+                
+            self.status_queue.put(('log', (f"📥 下载成功，文件大小: {len(dl_response.content)} 字节", 'info')))
+            
+            # 智能文件过滤：跳过明显不是我们系统的文件
+            if len(dl_response.content) < self.min_file_size:  # 文件太小，可能不是加密文件
+                self.status_queue.put(('log', (f"⚠️ 跳过小文件: {item.get('name', 'unknown')} ({len(dl_response.content)} 字节 < {self.min_file_size} 字节)", 'warning')))
+                # 安全修复：不删除服务器上的小文件，可能是其他用户的合法文件
+                self.status_queue.put(('log', (f"💡 提示: 服务器小文件已保留，可能是其他用户的文件", 'info')))
                 return
                 
             # 解密和解析
-            payload = decrypt_and_parse_payload(dl_response.content, self.password)
-            content = base64.b64decode(payload['content_base64'])
+            try:
+                payload = decrypt_and_parse_payload(dl_response.content, self.password)
+                content = base64.b64decode(payload['content_base64'])
+                self.status_queue.put(('log', (f"🔓 解密成功，载荷大小: {len(content)} 字节", 'info')))
+            except Exception as decrypt_error:
+                error_detail = str(decrypt_error) if decrypt_error else "未知解密错误"
+                self.status_queue.put(('log', (f"❌ 解密失败: {error_detail}", 'error')))
+                
+                # 记录文件信息用于调试
+                file_info = f"文件名: {item.get('name', 'unknown')}, 大小: {len(dl_response.content)} 字节"
+                self.status_queue.put(('log', (f"🔍 解密失败的文件信息: {file_info}", 'warning')))
+                
+                # 安全修复：只删除本地下载的文件，不删除服务器文件
+                # 因为可能是其他人上传的文件，删除服务器文件会影响其他用户
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        self.status_queue.put(('log', (f"🗑️ 已删除本地解密失败的文件: {item.get('name', 'unknown')}", 'info')))
+                    except Exception as e:
+                        self.status_queue.put(('log', (f"⚠️ 删除本地文件失败: {str(e)}", 'warning')))
+                
+                self.status_queue.put(('log', (f"💡 提示: 服务器文件已保留，可能是其他用户的文件", 'info')))
+                
+                # 不抛出异常，直接返回，避免后续处理
+                return
             
             download_time_ms = (time.time() - start_time) * 1000
             
             if payload.get('is_from_text', False):
                 # 文本内容复制到剪切板
-                pyperclip.copy(content.decode('utf-8'))
-                self.status_queue.put(('log', (f"📝 文本内容 '{payload['filename']}' 已复制到剪切板 [{download_time_ms:.1f}ms]", 'success')))
+                text_content = content.decode('utf-8')
+                if self._is_clipboard_change_safe(text_content):
+                    self._safe_copy_to_clipboard(text_content, f"文本内容 '{payload['filename']}'")
+                else:
+                    self.status_queue.put(('log', (f"📝 文本内容 '{payload['filename']}' 已下载，但剪切板变化过于频繁，跳过复制 [{download_time_ms:.1f}ms]", 'warning')))
             else:
                 # 文件保存
                 save_path = os.path.join(self.download_dir, payload['filename'])
                 with open(save_path, 'wb') as f:
                     f.write(content)
-                pyperclip.copy(os.path.abspath(save_path))
+                
+                # 安全复制文件路径到剪切板
+                file_path = os.path.abspath(save_path)
+                if self._is_clipboard_change_safe(file_path):
+                    self._safe_copy_to_clipboard(file_path, f"文件路径 '{payload['filename']}'")
+                else:
+                    self.status_queue.put(('log', (f"📁 文件 '{payload['filename']}' 已下载，但剪切板变化过于频繁，跳过复制 [{download_time_ms:.1f}ms]", 'warning')))
+                
                 file_size_kb = len(content) / 1024
                 self.status_queue.put(('log', (f"📁 文件 '{payload['filename']}' 已下载 [{file_size_kb:.1f}KB, {download_time_ms:.1f}ms]", 'success')))
             
@@ -829,13 +951,28 @@ class DownloaderApp:
             
         except Exception as e:
             self.stats['error_count'] += 1
-            self.status_queue.put(('log', (f"❌ 处理单个文件失败: {e}", 'error')))
+            error_msg = f"❌ 处理单个文件失败: {str(e)}"
+            if hasattr(e, '__traceback__'):
+                import traceback
+                tb_info = traceback.format_exc()
+                error_msg += f"\n   详细错误: {tb_info.split('File')[0].strip()}"
+            self.status_queue.put(('log', (error_msg, 'error')))
+        except BaseException as e:
+            # 捕获所有异常，包括KeyboardInterrupt等
+            self.stats['error_count'] += 1
+            error_msg = f"❌ 处理单个文件失败(严重错误): {str(e)}"
+            if hasattr(e, '__traceback__'):
+                import traceback
+                tb_info = traceback.format_exc()
+                error_msg += f"\n   详细错误: {tb_info.split('File')[0].strip()}"
+            self.status_queue.put(('log', (error_msg, 'error')))
 
     def handle_chunk(self, item, config, headers):
         """处理分片文件 - 异步优化版本"""
         # 异步执行分片下载和处理
         self.executor.submit(self._handle_chunk_async, item, config, headers)
     
+    @safe_operation("分片处理")
     def _handle_chunk_async(self, item, config, headers):
         """异步处理分片文件"""
         start_time = time.time()
@@ -858,8 +995,31 @@ class DownloaderApp:
                 return
                 
             # 解密分片内容
-            payload = decrypt_and_parse_payload(dl_response.content, self.password)
-            chunk_content = base64.b64decode(payload['content_base64'])
+            try:
+                payload = decrypt_and_parse_payload(dl_response.content, self.password)
+                chunk_content = base64.b64decode(payload['content_base64'])
+            except Exception as decrypt_error:
+                error_detail = str(decrypt_error) if decrypt_error else "未知解密错误"
+                self.status_queue.put(('log', (f"❌ 分片解密失败: {error_detail}", 'error')))
+                
+                # 记录分片信息
+                chunk_info = f"分片 {chunk_index}/{total_chunks}, 文件名: {original_filename}, 大小: {len(dl_response.content)} 字节"
+                self.status_queue.put(('log', (f"🔍 解密失败的分片信息: {chunk_info}", 'warning')))
+                
+                # 安全修复：只删除本地临时文件，不删除服务器文件
+                # 因为可能是其他人上传的文件，删除服务器文件会影响其他用户
+                if os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                        self.status_queue.put(('log', (f"🗑️ 已删除本地解密失败的分片: {chunk_index}/{total_chunks}", 'info')))
+                    except Exception as e:
+                        self.status_queue.put(('log', (f"⚠️ 删除本地分片失败: {str(e)}", 'warning')))
+                
+                self.status_queue.put(('log', (f"💡 提示: 服务器分片已保留，可能是其他用户的文件", 'info')))
+                
+                # 删除已下载的分片文件并退出
+                self._cleanup_temp_chunks(file_id)
+                return
             
             download_time_ms = (time.time() - start_time) * 1000
             chunk_size_kb = len(chunk_content) / 1024
@@ -896,8 +1056,14 @@ class DownloaderApp:
                     
         except Exception as e:
             self.stats['error_count'] += 1
-            self.status_queue.put(('log', (f"❌ 处理分片失败: {e}", 'error')))
+            error_msg = f"❌ 处理分片失败: {str(e)}"
+            if hasattr(e, '__traceback__'):
+                import traceback
+                tb_info = traceback.format_exc()
+                error_msg += f"\n   详细错误: {tb_info.split('File')[0].strip()}"
+            self.status_queue.put(('log', (error_msg, 'error')))
 
+    @safe_operation("文件合并")
     def _merge_chunks_async(self, upload_id, total_chunks, original_filename):
         """异步合并分片文件"""
         start_time = time.time()
@@ -933,8 +1099,12 @@ class DownloaderApp:
                             final_file.write(chunk_data)
                             total_size += len(chunk_data)
             
-            # 复制路径到剪切板
-            pyperclip.copy(os.path.abspath(final_path))
+            # 安全复制路径到剪切板
+            file_path = os.path.abspath(final_path)
+            if self._is_clipboard_change_safe(file_path):
+                self._safe_copy_to_clipboard(file_path, f"合并文件路径 '{original_filename}'")
+            else:
+                self.status_queue.put(('log', (f"🎉 文件合并成功: '{original_filename}'，但剪切板变化过于频繁，跳过复制", 'warning')))
             
             merge_time_ms = (time.time() - start_time) * 1000
             file_size_mb = total_size / (1024 * 1024)
@@ -948,7 +1118,12 @@ class DownloaderApp:
             
         except Exception as e:
             self.stats['error_count'] += 1
-            self.status_queue.put(('log', (f"❌ 合并文件失败: {e}", 'error')))
+            error_msg = f"❌ 合并文件失败: {str(e)}"
+            if hasattr(e, '__traceback__'):
+                import traceback
+                tb_info = traceback.format_exc()
+                error_msg += f"\n   详细错误: {tb_info.split('File')[0].strip()}"
+            self.status_queue.put(('log', (error_msg, 'error')))
         finally:
             # 清理临时文件夹
             if os.path.exists(upload_temp_dir):
@@ -964,6 +1139,76 @@ class DownloaderApp:
     def merge_chunks(self, upload_id, total_chunks, original_filename):
         """保持向后兼容的合并方法"""
         self._merge_chunks_async(upload_id, total_chunks, original_filename)
+
+    def _is_clipboard_change_safe(self, new_content: str) -> bool:
+        """检查剪切板变化是否安全，防止循环"""
+        current_time = time.time()
+        
+        with self.clipboard_protection['operation_lock']:
+            # 检查是否是自己操作
+            if self.clipboard_protection['is_self_operation']:
+                self.clipboard_protection['is_self_operation'] = False
+                return False
+            
+            # 检查内容是否相同
+            if new_content == self.clipboard_protection['last_clipboard_content']:
+                return False
+            
+            # 检查时间间隔
+            time_diff = current_time - self.clipboard_protection['last_clipboard_time']
+            if time_diff < self.clipboard_protection['min_interval_seconds']:
+                return False
+            
+            # 检查频率限制
+            self.clipboard_protection['change_timestamps'].append(current_time)
+            
+            # 清理超过1分钟的时间戳
+            cutoff_time = current_time - 60
+            while (self.clipboard_protection['change_timestamps'] and 
+                   self.clipboard_protection['change_timestamps'][0] < cutoff_time):
+                self.clipboard_protection['change_timestamps'].popleft()
+            
+            # 检查每分钟变化次数
+            if len(self.clipboard_protection['change_timestamps']) > self.clipboard_protection['max_changes_per_minute']:
+                self.status_queue.put(('log', ('⚠️ 剪切板变化过于频繁，已启用防护模式', 'warning')))
+                return False
+            
+            # 更新状态
+            self.clipboard_protection['last_clipboard_content'] = new_content
+            self.clipboard_protection['last_clipboard_time'] = current_time
+            self.clipboard_protection['clipboard_change_count'] += 1
+            
+            return True
+    
+    def _mark_self_operation(self):
+        """标记为自身操作，避免循环"""
+        with self.clipboard_protection['operation_lock']:
+            self.clipboard_protection['is_self_operation'] = True
+    
+    def _safe_copy_to_clipboard(self, content: str, operation_name: str = "操作"):
+        """安全地复制到剪切板，防止循环"""
+        try:
+            # 标记为自身操作
+            self._mark_self_operation()
+            
+            # 复制到剪切板
+            pyperclip.copy(content)
+            
+            # 记录操作
+            self.status_queue.put(('log', (f"📝 {operation_name}已复制到剪切板", 'success')))
+            
+        except Exception as e:
+            self.status_queue.put(('log', (f"❌ 复制到剪切板失败: {e}", 'error')))
+    
+    def _get_clipboard_protection_status(self) -> str:
+        """获取剪切板防护状态信息"""
+        with self.clipboard_protection['operation_lock']:
+            changes_last_minute = len(self.clipboard_protection['change_timestamps'])
+            last_change_ago = time.time() - self.clipboard_protection['last_clipboard_time']
+            
+            return (f"防护状态: 变化{changes_last_minute}/分钟, "
+                   f"上次变化{last_change_ago:.1f}秒前, "
+                   f"总变化{self.clipboard_protection['clipboard_change_count']}次")
 
 def main():
     root = None
