@@ -112,10 +112,17 @@ class DownloaderApp:
         self.download_dir = "./downloads/"
         self.temp_chunk_dir = os.path.join(self.download_dir, "temp_chunks")
         
+        # 分片下载状态跟踪（防止重复下载）
+        self.downloaded_chunks = {}  # {upload_id: set(chunk_indices)}
+        self.completed_uploads = set()  # 已完成合并的upload_id集合
+        self.chunks_lock = threading.Lock()  # 分片状态锁
+        
         # 智能轮询配置
         self.base_poll_interval = 5  # 基础间隔5秒
         self.current_poll_interval = 5  # 当前动态间隔
         self.max_poll_interval = 60  # 最大间隔60秒
+        self.chunk_poll_interval = 1  # 分片传输时的快速轮询间隔（1秒）
+        self.is_chunked_transfer = False  # 是否正在进行分片传输
         self.poll_increase_factor = 1.5  # 间隔递增因子
         self.consecutive_empty_polls = 0  # 连续空轮询计数
         self.auto_stop_minutes = 10  # 10分钟无文件自动停止
@@ -197,6 +204,7 @@ class DownloaderApp:
             self.base_poll_interval = int(config['DEFAULT'].get('BASE_POLL_INTERVAL', 5))
             self.current_poll_interval = self.base_poll_interval
             self.max_poll_interval = int(config['DEFAULT'].get('MAX_POLL_INTERVAL', 60))
+            self.chunk_poll_interval = int(config['DEFAULT'].get('chunk_poll_interval_seconds', 1))
             self.poll_increase_factor = float(config['DEFAULT'].get('POLL_INCREASE_FACTOR', 1.5))
             self.auto_stop_minutes = int(config['DEFAULT'].get('AUTO_STOP_MINUTES', 10))
             
@@ -205,7 +213,7 @@ class DownloaderApp:
             self.auto_delete_invalid = config['DEFAULT'].get('AUTO_DELETE_INVALID', 'True').lower() == 'true'
             
             # 记录智能轮询配置
-            self.status_queue.put(('log', (f'智能轮询配置加载: 基础间隔={self.base_poll_interval}s, 最大间隔={self.max_poll_interval}s, 递增因子={self.poll_increase_factor}, 自动停止={self.auto_stop_minutes}分钟', 'info')))
+            self.status_queue.put(('log', (f'智能轮询配置加载: 基础间隔={self.base_poll_interval}s, 分片间隔={self.chunk_poll_interval}s, 最大间隔={self.max_poll_interval}s, 递增因子={self.poll_increase_factor}, 自动停止={self.auto_stop_minutes}分钟', 'info')))
             self.status_queue.put(('log', (f'文件过滤配置加载: 最小文件大小={self.min_file_size}字节, 自动删除无效文件={self.auto_delete_invalid}', 'info')))
             
             if not os.path.exists(self.download_dir): os.makedirs(self.download_dir)
@@ -776,24 +784,47 @@ class DownloaderApp:
                 
             # 根据检查结果调整轮询间隔
             if files_found:
-                # 发现文件，重置为基础间隔
+                # 发现文件，检查是否是分片传输
                 self.consecutive_empty_polls = 0
-                self.current_poll_interval = self.base_poll_interval
                 self.last_file_found_time = time.time()
-                self.status_queue.put(('log', (f"发现文件，轮询间隔重置为 {self.current_poll_interval}s", 'success')))
-            else:
-                # 未发现文件，增加轮询间隔
-                self.consecutive_empty_polls += 1
                 
-                # 每3次空轮询增加一次间隔
-                if self.consecutive_empty_polls % 3 == 0:
-                    old_interval = self.current_poll_interval
-                    self.current_poll_interval = min(
-                        self.current_poll_interval * self.poll_increase_factor,
-                        self.max_poll_interval
-                    )
-                    if old_interval != self.current_poll_interval:
-                        self.status_queue.put(('log', (f"连续 {self.consecutive_empty_polls} 次空轮询，间隔调整为 {self.current_poll_interval:.1f}s", 'info')))
+                if self.is_chunked_transfer:
+                    # 分片传输中，使用快速轮询
+                    self.current_poll_interval = self.chunk_poll_interval
+                    self.status_queue.put(('log', (f"发现文件，分片传输快速轮询: {self.current_poll_interval}s", 'success')))
+                else:
+                    # 普通文件，使用基础间隔
+                    self.current_poll_interval = self.base_poll_interval
+                    self.status_queue.put(('log', (f"发现文件，轮询间隔重置为 {self.current_poll_interval}s", 'success')))
+            else:
+                # 未发现文件，检查分片传输是否完成
+                if self.is_chunked_transfer:
+                    # 检查是否还有未完成的分片传输
+                    with self.chunks_lock:
+                        has_active_chunks = any(
+                            upload_id not in self.completed_uploads 
+                            for upload_id in self.downloaded_chunks
+                        )
+                        
+                    if not has_active_chunks:
+                        # 所有分片传输已完成，恢复普通轮询
+                        self.is_chunked_transfer = False
+                        self.current_poll_interval = self.base_poll_interval
+                        self.status_queue.put(('log', (f"分片传输完成，恢复正常轮询: {self.current_poll_interval}s", 'info')))
+                
+                # 未发现文件，增加轮询间隔（仅限非分片传输）
+                if not self.is_chunked_transfer:
+                    self.consecutive_empty_polls += 1
+                    
+                    # 每3次空轮询增加一次间隔
+                    if self.consecutive_empty_polls % 3 == 0:
+                        old_interval = self.current_poll_interval
+                        self.current_poll_interval = min(
+                            self.current_poll_interval * self.poll_increase_factor,
+                            self.max_poll_interval
+                        )
+                        if old_interval != self.current_poll_interval:
+                            self.status_queue.put(('log', (f"连续 {self.consecutive_empty_polls} 次空轮询，间隔调整为 {self.current_poll_interval:.1f}s", 'info')))
             
             # 检查自动停止条件
             if self.last_file_found_time and (time.time() - self.last_file_found_time > auto_stop_seconds):
@@ -986,6 +1017,23 @@ class DownloaderApp:
             original_filename = urllib.parse.unquote(encoded_filename)
             chunk_index, total_chunks = int(chunk_index_str), int(total_chunks_str)
             
+            # 检查是否已完成合并，避免重复下载
+            with self.chunks_lock:
+                if upload_id in self.completed_uploads:
+                    self.status_queue.put(('log', (f"ℹ️ 跳过已完成的上传: {original_filename}", 'info')))
+                    return
+                
+                # 检查该分片是否已下载
+                if upload_id not in self.downloaded_chunks:
+                    self.downloaded_chunks[upload_id] = set()
+                    
+                if chunk_index in self.downloaded_chunks[upload_id]:
+                    self.status_queue.put(('log', (f"ℹ️ 跳过已下载的分片 {chunk_index}/{total_chunks} for {original_filename}", 'info')))
+                    return
+            
+            # 标记正在进行分片传输，启用快速轮询
+            self.is_chunked_transfer = True
+            
             self.status_queue.put(('log', (f"📦 下载分片 {chunk_index}/{total_chunks} for {original_filename}", 'info')))
             
             # 使用会话下载分片
@@ -1036,7 +1084,12 @@ class DownloaderApp:
             with open(chunk_file_path, 'wb') as f:
                 f.write(chunk_content)
             
-            self.status_queue.put(('log', (f"✅ 分片 {chunk_index}/{total_chunks} 已保存 [{chunk_size_kb:.1f}KB, {download_time_ms:.1f}ms]", 'success')))
+            # 更新分片下载状态
+            with self.chunks_lock:
+                self.downloaded_chunks[upload_id].add(chunk_index)
+                downloaded_count = len(self.downloaded_chunks[upload_id])
+            
+            self.status_queue.put(('log', (f"✅ 分片 {chunk_index}/{total_chunks} 已保存 [{chunk_size_kb:.1f}KB, {download_time_ms:.1f}ms] ({downloaded_count}/{total_chunks})", 'success')))
             
             # 异步删除服务器文件
             self.executor.submit(delete_server_file, file_id, config, self.status_queue)
@@ -1048,11 +1101,18 @@ class DownloaderApp:
                 merge_lock = self.merge_locks[upload_id]
             
             with merge_lock:
-                if not os.path.exists(upload_temp_dir): 
-                    return
-                if len(os.listdir(upload_temp_dir)) == total_chunks:
-                    # 异步合并文件
-                    self.executor.submit(self._merge_chunks_async, upload_id, total_chunks, original_filename)
+                # 再次检查是否已完成合并，防止重复合并
+                with self.chunks_lock:
+                    if upload_id in self.completed_uploads:
+                        return
+                    
+                    # 检查是否所有分片都已下载
+                    if len(self.downloaded_chunks[upload_id]) == total_chunks:
+                        # 标记为已完成，防止重复处理
+                        self.completed_uploads.add(upload_id)
+                        
+                        # 异步合并文件
+                        self.executor.submit(self._merge_chunks_async, upload_id, total_chunks, original_filename)
                     
         except Exception as e:
             self.stats['error_count'] += 1
@@ -1131,6 +1191,11 @@ class DownloaderApp:
                     shutil.rmtree(upload_temp_dir, ignore_errors=True)
                 except Exception as e:
                     self.status_queue.put(('log', (f"⚠️ 清理临时文件失败: {e}", 'warning')))
+            
+            # 清理状态跟踪信息
+            with self.chunks_lock:
+                self.downloaded_chunks.pop(upload_id, None)
+                # completed_uploads 保留，用于防止重复下载
             
             # 清理锁
             with self.locks_lock:
