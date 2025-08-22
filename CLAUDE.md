@@ -94,6 +94,10 @@ chunk_size_mb = 3
 # 轮询配置
 poll_interval_seconds = 10
 chunk_poll_interval_seconds = 1  # 分片传输时的快速轮询间隔
+
+# 剪切板保护配置
+clipboard_min_interval_seconds = 0.5  # 剪切板操作最小间隔
+clipboard_max_changes_per_minute = 30  # 每分钟最大剪切板变化次数
 ```
 
 ### 配置管理器特性
