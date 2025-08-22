@@ -121,19 +121,20 @@ class OptimizedClipboardUploader:
             'pending_cleanups': {},    # 待清理文件映射
         }
         
-        # 剪切板循环防护机制
+        # 剪切板循环防护机制（优化版）
         self.clipboard_protection = {
             'last_text_content': '',       # 上次文本内容
             'last_text_hash': '',          # 上次文本哈希
             'last_file_paths': [],         # 上次文件路径
             'last_change_time': 0,         # 上次变化时间
-            'min_interval_seconds': 1.5,   # 最小间隔1.5秒
-            'max_changes_per_minute': 15,  # 每分钟最大变化次数
+            'min_interval_seconds': 0.5,   # 最小间隔0.5秒（降低限制）
+            'max_changes_per_minute': 30,  # 每分钟最大30次变化（提高限制）
             'change_timestamps': deque(maxlen=60),  # 变化时间戳记录
             'is_self_operation': False,    # 是否是自己操作
             'operation_lock': threading.Lock(),  # 操作锁
             'content_blacklist': set(),    # 内容黑名单（最近处理过的）
-            'blacklist_max_size': 50      # 黑名单最大大小
+            'blacklist_max_size': 50,      # 黑名单最大大小
+            'idle_reset_minutes': 2        # 2分钟无活动后重置状态
         }
         
         # 性能统计
@@ -172,7 +173,12 @@ class OptimizedClipboardUploader:
             self.chunk_size_bytes = self.chunk_size_mb * 1024 * 1024
             self.poll_interval = float(config['DEFAULT'].get('poll_interval_seconds', 10))
             
+            # 从配置文件更新剪切板保护参数
+            self.clipboard_protection['min_interval_seconds'] = float(config['DEFAULT'].get('clipboard_min_interval_seconds', 0.5))
+            self.clipboard_protection['max_changes_per_minute'] = int(config['DEFAULT'].get('clipboard_max_changes_per_minute', 30))
+            
             self._log_message(f"配置加载成功: 文件限制{self.max_file_size_mb}MB, 分块{self.chunk_size_mb}MB", 'info')
+            self._log_message(f"剪切板保护配置: 最小间隔={self.clipboard_protection['min_interval_seconds']}s, 最大变化={self.clipboard_protection['max_changes_per_minute']}次/分钟", 'info')
         except Exception as e:
             self.config_manager = None
             self.max_file_size_mb = 6
@@ -1083,7 +1089,7 @@ class OptimizedClipboardUploader:
                 self.root.destroy()
 
     def _is_clipboard_change_safe(self, new_content: str, content_type: str = 'text') -> bool:
-        """检查剪切板变化是否安全，防止循环"""
+        """检查剪切板变化是否安全，防止循环（优化版）"""
         current_time = time.time()
         
         with self.clipboard_protection['operation_lock']:
@@ -1105,24 +1111,34 @@ class OptimizedClipboardUploader:
                 if new_content in self.clipboard_protection['last_file_paths']:
                     return False
             
+            # 检查空闲重置：2分钟无活动后重置状态
+            idle_seconds = current_time - self.clipboard_protection['last_change_time']
+            if idle_seconds > (self.clipboard_protection['idle_reset_minutes'] * 60):
+                # 长时间无活动，重置保护状态
+                self.clipboard_protection['change_timestamps'].clear()
+                self.clipboard_protection['content_blacklist'].clear()
+                self._log_message('🔄 剪切板保护状态已重置（长时间无活动）', 'info')
+            
             # 检查时间间隔
             time_diff = current_time - self.clipboard_protection['last_change_time']
             if time_diff < self.clipboard_protection['min_interval_seconds']:
+                self._log_message(f'⏰ 剪切板操作间隔过短 ({time_diff:.1f}s < {self.clipboard_protection["min_interval_seconds"]}s)', 'debug')
                 return False
             
-            # 检查频率限制
-            self.clipboard_protection['change_timestamps'].append(current_time)
-            
-            # 清理超过1分钟的时间戳
+            # 清理超过1分钟的时间戳（在检查前先清理）
             cutoff_time = current_time - 60
             while (self.clipboard_protection['change_timestamps'] and 
                    self.clipboard_protection['change_timestamps'][0] < cutoff_time):
                 self.clipboard_protection['change_timestamps'].popleft()
             
-            # 检查每分钟变化次数
-            if len(self.clipboard_protection['change_timestamps']) > self.clipboard_protection['max_changes_per_minute']:
-                self._log_message('⚠️ 剪切板变化过于频繁，已启用防护模式', 'warning')
+            # 检查每分钟变化次数（在添加新时间戳前检查）
+            changes_this_minute = len(self.clipboard_protection['change_timestamps'])
+            if changes_this_minute >= self.clipboard_protection['max_changes_per_minute']:
+                self._log_message(f'⚠️ 剪切板变化过于频繁 ({changes_this_minute}/{self.clipboard_protection["max_changes_per_minute"]} 次/分钟)，已启用防护模式', 'warning')
                 return False
+            
+            # 频率检查通过后，添加时间戳
+            self.clipboard_protection['change_timestamps'].append(current_time)
             
             # 更新状态
             if content_type == 'text':

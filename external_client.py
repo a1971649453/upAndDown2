@@ -1,4 +1,5 @@
 # external_client.py (v5.9 - 性能优化版)
+# 修改时间：2024-08-22 - 剪切板频繁检测修复版本
 
 import os
 import sys
@@ -105,6 +106,9 @@ class SplashScreen:
 # --- 主应用类 (修正版) ---
 class DownloaderApp:
     def __init__(self, root):
+        # 立即输出版本标识
+        print("🔍 DEBUG: external_client.py 修改版本 - 2024-08-22")
+        
         self.root = root
         self.root.title("安全云剪切板 (下载端) v5.9 - 性能优化版")
         self.password = None
@@ -116,6 +120,10 @@ class DownloaderApp:
         self.downloaded_chunks = {}  # {upload_id: set(chunk_indices)}
         self.completed_uploads = set()  # 已完成合并的upload_id集合
         self.chunks_lock = threading.Lock()  # 分片状态锁
+        
+        # 缓存初始化期间的日志消息
+        self.init_log_cache = []
+        self.ui_created = False
         
         # 智能轮询配置
         self.base_poll_interval = 5  # 基础间隔5秒
@@ -156,16 +164,19 @@ class DownloaderApp:
             'start_time': time.time()
         }
         
-        # 剪切板循环防护机制
+        # 剪切板循环防护机制（优化版）
         self.clipboard_protection = {
             'last_clipboard_content': '',  # 上次剪切板内容
             'last_clipboard_time': 0,      # 上次剪切板时间
             'clipboard_change_count': 0,   # 剪切板变化计数
-            'min_interval_seconds': 2.0,   # 最小间隔2秒
-            'max_changes_per_minute': 10,  # 每分钟最大变化次数
+            'min_interval_seconds': 0.5,   # 最小间隔0.5秒（降低限制）
+            'max_changes_per_minute': 30,  # 每分钟最大30次变化（提高限制）
             'change_timestamps': deque(maxlen=60),  # 变化时间戳记录
             'is_self_operation': False,    # 是否是自己操作
-            'operation_lock': threading.Lock()  # 操作锁
+            'self_operation_content': '',  # 自己操作的内容
+            'self_operation_expire_time': 0,  # 自己操作的过期时间
+            'operation_lock': threading.Lock(),  # 操作锁
+            'idle_reset_minutes': 2        # 2分钟无活动后重置状态
         }
         
         self.is_monitoring = threading.Event()
@@ -188,33 +199,46 @@ class DownloaderApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def run_initialization(self):
+        self.status_queue.put(('log', ('🔍 开始执行初始化流程...', 'info')))
         try:
             self.status_queue.put(('log', ('正在读取安全密钥...', 'info')))
             self.password = keyring.get_password("cloud_clipboard_service", "secret_key")
+            self.status_queue.put(('log', (f'🔍 密钥读取结果: {"成功" if self.password else "失败"}', 'info')))
             if not self.password:
                 self.status_queue.put(('init_fail', "密钥错误: 未在系统凭据管理器中找到密钥！"))
                 return
 
             self.status_queue.put(('log', ('正在加载配置文件...', 'info')))
             config = self.config_manager.load_config()
-            self.download_dir = config['DEFAULT']['DOWNLOAD_DIR']
+            
+            # 强制调试信息
+            self.status_queue.put(('log', ('🔍 配置对象获取成功，开始读取参数...', 'info')))
+            
+            self.download_dir = config['DEFAULT'].get('download_dir', './downloads/')
             self.temp_chunk_dir = os.path.join(self.download_dir, "temp_chunks")
             
             # 加载智能轮询配置
-            self.base_poll_interval = int(config['DEFAULT'].get('BASE_POLL_INTERVAL', 5))
+            self.base_poll_interval = int(config['DEFAULT'].get('base_poll_interval', 5))
             self.current_poll_interval = self.base_poll_interval
-            self.max_poll_interval = int(config['DEFAULT'].get('MAX_POLL_INTERVAL', 60))
+            self.max_poll_interval = int(config['DEFAULT'].get('max_poll_interval', 60))
             self.chunk_poll_interval = int(config['DEFAULT'].get('chunk_poll_interval_seconds', 1))
-            self.poll_increase_factor = float(config['DEFAULT'].get('POLL_INCREASE_FACTOR', 1.5))
-            self.auto_stop_minutes = int(config['DEFAULT'].get('AUTO_STOP_MINUTES', 10))
+            self.poll_increase_factor = float(config['DEFAULT'].get('poll_increase_factor', 1.5))
+            self.auto_stop_minutes = int(config['DEFAULT'].get('auto_stop_minutes', 10))
+            
+            self.status_queue.put(('log', ('🔍 轮询配置读取完成...', 'info')))
             
             # 加载文件过滤配置
-            self.min_file_size = int(config['DEFAULT'].get('MIN_FILE_SIZE', 100))
-            self.auto_delete_invalid = config['DEFAULT'].get('AUTO_DELETE_INVALID', 'True').lower() == 'true'
+            self.min_file_size = int(config['DEFAULT'].get('min_file_size', 100))
+            self.auto_delete_invalid = config['DEFAULT'].get('auto_delete_invalid', 'True').lower() == 'true'
+            
+            # 从配置文件更新剪切板保护参数
+            self.clipboard_protection['min_interval_seconds'] = float(config['DEFAULT'].get('clipboard_min_interval_seconds', 0.5))
+            self.clipboard_protection['max_changes_per_minute'] = int(config['DEFAULT'].get('clipboard_max_changes_per_minute', 30))
             
             # 记录智能轮询配置
             self.status_queue.put(('log', (f'智能轮询配置加载: 基础间隔={self.base_poll_interval}s, 分片间隔={self.chunk_poll_interval}s, 最大间隔={self.max_poll_interval}s, 递增因子={self.poll_increase_factor}, 自动停止={self.auto_stop_minutes}分钟', 'info')))
             self.status_queue.put(('log', (f'文件过滤配置加载: 最小文件大小={self.min_file_size}字节, 自动删除无效文件={self.auto_delete_invalid}', 'info')))
+            self.status_queue.put(('log', (f'剪切板保护配置: 最小间隔={self.clipboard_protection["min_interval_seconds"]}s, 最大变化={self.clipboard_protection["max_changes_per_minute"]}次/分钟', 'info')))
             
             if not os.path.exists(self.download_dir): os.makedirs(self.download_dir)
             if not os.path.exists(self.temp_chunk_dir): os.makedirs(self.temp_chunk_dir)
@@ -225,7 +249,9 @@ class DownloaderApp:
 
             self.status_queue.put(('init_success', '初始化成功，应用准备就绪。'))
         except Exception as e:
-            self.status_queue.put(('init_fail', f"初始化失败: {e}"))
+            import traceback
+            error_detail = traceback.format_exc()
+            self.status_queue.put(('init_fail', f"初始化失败: {e}\n详细错误:\n{error_detail}"))
 
     def process_queue(self):
         try:
@@ -238,6 +264,14 @@ class DownloaderApp:
                     continue
                 if msg_type == 'init_success':
                     self.create_widgets()
+                    self.ui_created = True
+                    
+                    # 显示缓存的初始化日志
+                    for cached_message, cached_type in self.init_log_cache:
+                        self.log_message(cached_message, cached_type)
+                    self.init_log_cache.clear()  # 清空缓存
+                    
+                    # 显示初始化成功消息
                     self.log_message(message, 'success')
                     if CTK_AVAILABLE:
                         self.start_button.configure(state='normal')
@@ -258,9 +292,13 @@ class DownloaderApp:
                     else:
                         self.status_label.config(text="状态: 启动失败")
                 elif msg_type == 'log':
-                    if hasattr(self, 'log_area'):
-                        log_message, log_type = message
+                    log_message, log_type = message
+                    if self.ui_created and hasattr(self, 'log_area'):
+                        # UI已创建，直接显示日志
                         self.log_message(log_message, log_type)
+                    else:
+                        # UI未创建，缓存日志
+                        self.init_log_cache.append((log_message, log_type))
                 elif msg_type == 'update_count':
                     if hasattr(self, 'count_label'):
                         if CTK_AVAILABLE:
@@ -330,7 +368,12 @@ class DownloaderApp:
             except Exception as e:
                 self.status_queue.put(('log', (f"⚠️ 会话关闭异常: {e}", 'warning')))
             
-            self.root.destroy()
+            # 安全销毁窗口
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                # 窗口已经被销毁，忽略错误
+                pass
 
     def setup_styles(self):
         if CTK_AVAILABLE:
@@ -1206,37 +1249,91 @@ class DownloaderApp:
         self._merge_chunks_async(upload_id, total_chunks, original_filename)
 
     def _is_clipboard_change_safe(self, new_content: str) -> bool:
-        """检查剪切板变化是否安全，防止循环"""
+        """检查剪切板变化是否安全，防止循环（优化版）"""
         current_time = time.time()
         
+        # 添加详细诊断日志 - 显示调用信息
+        content_preview = new_content[:50] + '...' if len(new_content) > 50 else new_content
+        self.status_queue.put(('log', (f'DEBUG 剪切板安全检查: 内容="{content_preview}", 当前时间={current_time:.1f}', 'debug')))
+        
+        # 添加详细配置日志
+        self.status_queue.put(('log', (f'DEBUG 当前配置：间隔={self.clipboard_protection.get("min_interval_seconds", "未知")}s，限制={self.clipboard_protection.get("max_changes_per_minute", "未知")}/分钟', 'debug')))
+        
         with self.clipboard_protection['operation_lock']:
-            # 检查是否是自己操作
-            if self.clipboard_protection['is_self_operation']:
+            # 检查是否是自己操作（增强版 - 内容和时间双重检查）
+            current_time = time.time()
+            
+            # 检查自身操作是否过期（2秒后过期）
+            if (self.clipboard_protection['is_self_operation'] and 
+                current_time > self.clipboard_protection['self_operation_expire_time']):
+                self.status_queue.put(('log', ('DEBUG 自身操作标记已过期，清除标记', 'debug')))
                 self.clipboard_protection['is_self_operation'] = False
+                self.clipboard_protection['self_operation_content'] = ''
+            
+            # 检查是否是自己操作（内容匹配检查）
+            if (self.clipboard_protection['is_self_operation'] and 
+                new_content == self.clipboard_protection['self_operation_content']):
+                self.status_queue.put(('log', ('DEBUG 检测到自身操作（内容匹配），跳过', 'debug')))
+                self.clipboard_protection['is_self_operation'] = False
+                self.clipboard_protection['self_operation_content'] = ''
                 return False
+            elif self.clipboard_protection['is_self_operation']:
+                # 内容不匹配，这是一个新的操作
+                self.status_queue.put(('log', ('DEBUG 内容不匹配，清除自身操作标记，继续检查', 'debug')))
+                self.clipboard_protection['is_self_operation'] = False
+                self.clipboard_protection['self_operation_content'] = ''
             
             # 检查内容是否相同
             if new_content == self.clipboard_protection['last_clipboard_content']:
+                self.status_queue.put(('log', ('DEBUG 剪切板内容相同，跳过', 'debug')))
                 return False
+            
+            # 检查空闲重置：2分钟无活动后重置状态
+            idle_seconds = current_time - self.clipboard_protection['last_clipboard_time']
+            self.status_queue.put(('log', (f'DEBUG 空闲检查：{idle_seconds:.1f}s (阈值: {self.clipboard_protection["idle_reset_minutes"] * 60}s)', 'debug')))
+            if idle_seconds > (self.clipboard_protection['idle_reset_minutes'] * 60):
+                # 长时间无活动，重置保护状态
+                self.clipboard_protection['change_timestamps'].clear()
+                self.clipboard_protection['clipboard_change_count'] = 0
+                self.clipboard_protection['last_clipboard_content'] = ''  # 清理内容缓存
+                self.status_queue.put(('log', ('INFO 剪切板保护状态已重置（长时间无活动）', 'info')))
+                self.status_queue.put(('log', (f'DEBUG 重置后配置：间隔={self.clipboard_protection["min_interval_seconds"]}s，限制={self.clipboard_protection["max_changes_per_minute"]}/分钟', 'debug')))
             
             # 检查时间间隔
             time_diff = current_time - self.clipboard_protection['last_clipboard_time']
+            self.status_queue.put(('log', (f'DEBUG 时间间隔检查：{time_diff:.1f}s (最小要求: {self.clipboard_protection["min_interval_seconds"]}s)', 'debug')))
             if time_diff < self.clipboard_protection['min_interval_seconds']:
+                self.status_queue.put(('log', (f'WARNING 剪切板操作间隔过短 ({time_diff:.1f}s < {self.clipboard_protection["min_interval_seconds"]}s)', 'debug')))
                 return False
             
-            # 检查频率限制
-            self.clipboard_protection['change_timestamps'].append(current_time)
-            
-            # 清理超过1分钟的时间戳
+            # 清理超过1分钟的时间戳（在检查前先清理）
             cutoff_time = current_time - 60
+            old_count = len(self.clipboard_protection['change_timestamps'])
             while (self.clipboard_protection['change_timestamps'] and 
                    self.clipboard_protection['change_timestamps'][0] < cutoff_time):
                 self.clipboard_protection['change_timestamps'].popleft()
+            new_count = len(self.clipboard_protection['change_timestamps'])
             
-            # 检查每分钟变化次数
-            if len(self.clipboard_protection['change_timestamps']) > self.clipboard_protection['max_changes_per_minute']:
-                self.status_queue.put(('log', ('⚠️ 剪切板变化过于频繁，已启用防护模式', 'warning')))
+            if old_count != new_count:
+                self.status_queue.put(('log', (f'DEBUG 清理过期时间戳：{old_count} -> {new_count}', 'debug')))
+            
+            # 检查每分钟变化次数（在添加新时间戳前检查）
+            changes_this_minute = len(self.clipboard_protection['change_timestamps'])
+            self.status_queue.put(('log', (f'DEBUG 频率检查：{changes_this_minute}/{self.clipboard_protection["max_changes_per_minute"]} 次/分钟', 'debug')))
+            
+            if changes_this_minute >= self.clipboard_protection['max_changes_per_minute']:
+                self.status_queue.put(('log', (f'WARNING 剪切板变化过于频繁 ({changes_this_minute}/{self.clipboard_protection["max_changes_per_minute"]} 次/分钟)，已启用防护模式', 'warning')))
+                # 添加调试信息
+                if self.clipboard_protection['change_timestamps']:
+                    oldest = self.clipboard_protection['change_timestamps'][0]
+                    newest = self.clipboard_protection['change_timestamps'][-1] if len(self.clipboard_protection['change_timestamps']) > 1 else oldest
+                    self.status_queue.put(('log', (f'DEBUG 调试：时间戳范围 {oldest:.1f} - {newest:.1f}，当前时间 {current_time:.1f}', 'debug')))
                 return False
+            
+            # 频率检查通过后，添加时间戳
+            self.clipboard_protection['change_timestamps'].append(current_time)
+            
+            self.status_queue.put(('log', ('SUCCESS 剪切板安全检查通过，允许复制', 'debug')))
             
             # 更新状态
             self.clipboard_protection['last_clipboard_content'] = new_content
@@ -1245,25 +1342,30 @@ class DownloaderApp:
             
             return True
     
-    def _mark_self_operation(self):
-        """标记为自身操作，避免循环"""
+    def _mark_self_operation(self, content: str):
+        """标记为自身操作，避免循环（增强版）"""
         with self.clipboard_protection['operation_lock']:
             self.clipboard_protection['is_self_operation'] = True
+            self.clipboard_protection['self_operation_content'] = content
+            self.clipboard_protection['self_operation_expire_time'] = time.time() + 2.0  # 2秒后过期
+            self.status_queue.put(('log', (f'DEBUG 标记自身操作，内容长度={len(content)}，2秒后过期', 'debug')))
     
     def _safe_copy_to_clipboard(self, content: str, operation_name: str = "操作"):
         """安全地复制到剪切板，防止循环"""
         try:
-            # 标记为自身操作
-            self._mark_self_operation()
+            self.status_queue.put(('log', (f'DEBUG 准备复制到剪切板: {operation_name}', 'debug')))
+            
+            # 标记为自身操作（传递具体内容）
+            self._mark_self_operation(content)
             
             # 复制到剪切板
             pyperclip.copy(content)
             
             # 记录操作
-            self.status_queue.put(('log', (f"📝 {operation_name}已复制到剪切板", 'success')))
+            self.status_queue.put(('log', (f"SUCCESS {operation_name}已复制到剪切板", 'success')))
             
         except Exception as e:
-            self.status_queue.put(('log', (f"❌ 复制到剪切板失败: {e}", 'error')))
+            self.status_queue.put(('log', (f"ERROR 复制到剪切板失败: {e}", 'error')))
     
     def _get_clipboard_protection_status(self) -> str:
         """获取剪切板防护状态信息"""
@@ -1298,8 +1400,15 @@ def main():
     except Exception as e:
         messagebox.showerror("严重错误", f"应用发生无法恢复的错误: {e}")
     finally:
-        if root and root.winfo_exists():
-            root.quit()
+        try:
+            if root and root.winfo_exists():
+                root.quit()
+        except tk.TclError:
+            # 窗口已经被销毁，忽略这个错误
+            pass
+        except Exception as e:
+            # 其他清理错误，记录但不阻止程序退出
+            print(f"清理时发生错误: {e}")
 
 if __name__ == '__main__':
     main()
